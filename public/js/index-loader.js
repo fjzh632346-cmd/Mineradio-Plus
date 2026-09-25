@@ -108,6 +108,17 @@
     'js/modules/10-shell/04-desktop-overlay-fullscreen.js',
     'js/modules/10-shell/05-startup-bindings.js',
     'js/modules/11-main-loop.js',
+    'js/modules/12-home-themes/00-home-model.js',
+    'js/modules/12-home-themes/01-theme-host.js',
+    'js/modules/12-home-themes/10-theme-star-atlas.js',
+    'js/modules/12-home-themes/11-theme-fm-dial.js',
+    'js/modules/12-home-themes/12-theme-riso-poster.js',
+    'js/modules/13-desktop-extras/00-desktop-puzzle.js',
+    'js/modules/13-desktop-extras/01-desktop-icon-auto.js',
+    'js/modules/13-desktop-extras/02-right-click-back.js',
+    'js/modules/13-desktop-extras/03-desktop-bg-button.js',
+    'js/modules/13-desktop-extras/04-desktop-top-player.js',
+    'js/modules/13-desktop-extras/05-desktop-fps-cap.js',
   ];
 
   function readModule(path) {

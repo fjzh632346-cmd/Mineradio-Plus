@@ -818,6 +818,50 @@ function broadcastDesktopWallpaperStatus(status) {
     escapeShortcutRegistered: fullDesktopEscapeRegistered === true,
   });
   if (tray) createOrUpdateTray();
+  syncDesktopLockCursorWatcher();
+}
+
+// [二改] 锁定软件操作后，窗口不再收鼠标，原版靠"转发的鼠标移动"发现光标到了右上角，
+// 但窗口挂在 Explorer 底下时这些转发收不到，于是右上角的解锁永远点不到。
+// 这里改由主进程直接轮询系统光标位置：光标进右上角那块，就临时把鼠标还给 Mineradio。
+const DESKTOP_LOCK_ZONE = { width: 340, height: 160 };
+let desktopLockCursorTimer = null;
+let desktopLockCursorInside = false;
+function desktopLockZoneContains(point) {
+  const status = fullDesktopModeRuntime.getStatus('lock-cursor-zone');
+  const bounds = status && status.bounds && Number(status.bounds.width) > 0
+    ? status.bounds
+    : (mainWindow && !mainWindow.isDestroyed() ? screen.getDisplayMatching(mainWindow.getBounds()).bounds : null);
+  if (!bounds || !point) return false;
+  const right = bounds.x + bounds.width;
+  return point.x >= right - DESKTOP_LOCK_ZONE.width && point.x <= right
+    && point.y >= bounds.y && point.y <= bounds.y + DESKTOP_LOCK_ZONE.height;
+}
+function syncDesktopLockCursorWatcher() {
+  const status = fullDesktopModeRuntime.getStatus('lock-cursor-watch');
+  const shouldWatch = status.enabled === true && status.interactive === true && status.softwareInteractionLocked === true;
+  if (!shouldWatch) {
+    if (desktopLockCursorTimer) { clearInterval(desktopLockCursorTimer); desktopLockCursorTimer = null; }
+    desktopLockCursorInside = false;
+    return;
+  }
+  if (desktopLockCursorTimer) return;
+  desktopLockCursorTimer = setInterval(() => {
+    let inside = false;
+    try { inside = desktopLockZoneContains(screen.getCursorScreenPoint()); } catch (_) { inside = false; }
+    if (inside === desktopLockCursorInside) return;
+    desktopLockCursorInside = inside;
+    fullDesktopModeRuntime.updatePointerRoute({ overSoftwareUi: false, overDesktopControls: inside }, 'main-lock-cursor-zone');
+    try {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('mineradio-desktop-lock-zone', { inside });
+    } catch (_) { }
+  }, 90);
+}
+
+function setDesktopSoftwareUnlocked(reason) {
+  const status = fullDesktopModeRuntime.getStatus(`${reason}-unlock`);
+  if (status.enabled !== true || status.softwareInteractionLocked !== true) return Promise.resolve(false);
+  return fullDesktopModeRuntime.setSoftwareInteractionLocked(false, reason).catch(() => false);
 }
 
 function wallpaperEngineProvidesDesktopBackdrop() {
@@ -1427,8 +1471,235 @@ function syncWallpaperEngineWithFullDesktopMode(win, reason = 'desktop-state') {
     resumeWallpaperEngineForVisibleHost(win, `full-desktop-${reason}`);
   }
   if (tray) createOrUpdateTray();
+  // [二改] 每次桌面模式切换落定后，让 Chromium 整窗重画一次，避免宿主换了之后停在旧帧。
+  try { win.webContents.invalidate(); } catch (_) { }
   sendWindowState(win);
 }
+
+// [二改] 桌面背景拼图动画：让渲染端播一段拼合 / 散落动画。
+// 动画只是锦上添花：超时或出错都直接放行，绝不挡住真正的模式切换。
+const DESKTOP_PUZZLE_USER_EXIT_REASONS = new Set(['renderer-disabled', 'escape-key', 'tray-exit-desktop-mode']);
+function runDesktopPuzzleStep(step, timeoutMs = 2400) {
+  const win = mainWindow;
+  if (!win || win.isDestroyed() || appQuitting) return Promise.resolve({ ok: false, skipped: true });
+  const safeStep = String(step || '').replace(/[^a-zA-Z]/g, '');
+  const script = `(() => {
+    const puzzle = window.__mineradioDesktopPuzzle;
+    if (!puzzle || typeof puzzle[${JSON.stringify(safeStep)}] !== 'function') return { ok: false, skipped: true };
+    return Promise.resolve(puzzle[${JSON.stringify(safeStep)}]())
+      .then((value) => value && typeof value === 'object' ? value : { ok: true })
+      .catch((error) => ({ ok: false, error: String(error && error.message || error).slice(0, 200) }));
+  })()`;
+  let timer = null;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ ok: false, timeout: true }), Math.max(200, Number(timeoutMs) || 2400));
+  });
+  const run = Promise.resolve()
+    .then(() => win.webContents.executeJavaScript(script, true))
+    .catch((error) => ({ ok: false, error: String(error && error.message || error) }));
+  return Promise.race([run, timeout]).finally(() => { if (timer) clearTimeout(timer); });
+}
+
+// [二改] 桌面模式诊断：每次进出桌面模式，把窗口状态、渲染端状态和一张截图
+// 存到 <程序目录>/_debug_desktop/，方便排查"切回来变黑"。同名截图每次覆盖，日志只留最近一段。
+const DESKTOP_DEBUG_DIR = path.join(app.isPackaged ? STABLE_USER_DATA_PATH : app.getAppPath(), '_debug_desktop');
+const DESKTOP_DEBUG_PROBE = `(() => {
+  const q = (sel) => document.querySelector(sel);
+  const cs = (el) => { if (!el) return null; const s = getComputedStyle(el); return { display: s.display, visibility: s.visibility, opacity: s.opacity, mask: String(s.webkitMaskImage || s.maskImage || '').slice(0, 40), filter: s.filter, transform: s.transform, bg: String(s.backgroundImage || '').slice(0, 60), bgColor: s.backgroundColor }; };
+  const cv = typeof renderer !== 'undefined' && renderer ? renderer.domElement : null;
+  let lost = null; try { lost = cv ? renderer.getContext().isContextLost() : null; } catch (e) { lost = 'err'; }
+  const mid = document.elementFromPoint(innerWidth / 2, innerHeight / 2);
+  return {
+    visibility: document.visibilityState, hasFocus: document.hasFocus(), inner: [innerWidth, innerHeight, devicePixelRatio],
+    htmlClass: document.documentElement.className, bodyClass: document.body.className,
+    shell: cs(q('#desktop-window-shell')), albumBg: cs(q('#album-bg')), customBg: cs(q('#custom-bg')), weLayer: cs(q('#wallpaper-engine-layer')), themeRoot: cs(q('#home-theme-root')),
+    canvas: cv ? { w: cv.width, h: cv.height, css: cs(cv), contextLost: lost } : null,
+    renderPower: typeof renderPowerState !== 'undefined' ? renderPowerState : null,
+    runtime: typeof desktopRuntimeState !== 'undefined' ? desktopRuntimeState : null,
+    fx: typeof fx !== 'undefined' && fx ? { wallpaperMode: fx.wallpaperMode, backgroundOpacity: fx.backgroundOpacity, backgroundColorMode: fx.backgroundColorMode, backgroundColor: fx.backgroundColor, performanceBackground: fx.performanceBackground } : null,
+    center: mid ? (mid.tagName + '#' + (mid.id || '') + '.' + String(mid.className || '').slice(0, 60)) : null,
+    home: typeof emptyHomeActive !== 'undefined' ? emptyHomeActive : null,
+    theme: typeof homeThemeHost !== 'undefined' ? { current: homeThemeHost.current, visible: homeThemeHost.visible } : null
+  };
+})()`;
+function desktopDebugTrim(file) {
+  try {
+    const st = fs.statSync(file);
+    if (st.size > 600 * 1024) {
+      const text = fs.readFileSync(file, 'utf8');
+      fs.writeFileSync(file, text.slice(-300 * 1024));
+    }
+  } catch (_) { }
+}
+async function desktopDebugSnapshot(label, extra = {}) {
+  const win = mainWindow;
+  if (!win || win.isDestroyed() || appQuitting) return;
+  try {
+    fs.mkdirSync(DESKTOP_DEBUG_DIR, { recursive: true });
+    const safeLabel = String(label || 'snap').replace(/[^a-zA-Z0-9_+-]/g, '_').slice(0, 60);
+    let probe = null;
+    try {
+      probe = await Promise.race([
+        win.webContents.executeJavaScript(DESKTOP_DEBUG_PROBE, true),
+        new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), 900)),
+      ]);
+    } catch (error) { probe = { error: String(error && error.message || error) }; }
+    const status = fullDesktopModeRuntime.getStatus(`debug-${safeLabel}`);
+    const entry = {
+      at: new Date().toISOString(),
+      label: safeLabel,
+      extra,
+      window: {
+        visible: win.isVisible(), minimized: win.isMinimized(), maximized: win.isMaximized(), fullScreen: win.isFullScreen(),
+        focused: win.isFocused(), bounds: win.getBounds(), contentBounds: win.getContentBounds(),
+        bgThrottling: win.webContents.getBackgroundThrottling ? win.webContents.getBackgroundThrottling() : null,
+      },
+      desktop: { enabled: status.enabled, interactive: status.interactive, phase: status.phase, lastError: status.lastError, iconLayerMode: status.iconLayerMode, desktopIconsVisible: status.desktopIconsVisible, softwareLocked: status.softwareInteractionLocked },
+      nativeAck: fullDesktopModeRuntime.lastNativeAck || null,
+      wallpaperEngine: (() => { try { const w = wallpaperEngineRuntime.getStatus(); return w ? { active: w.active, captureMode: w.captureMode } : null; } catch (_) { return null; } })(),
+      renderer: probe,
+    };
+    const logFile = path.join(DESKTOP_DEBUG_DIR, 'log.jsonl');
+    fs.appendFileSync(logFile, JSON.stringify(entry) + '\n');
+    desktopDebugTrim(logFile);
+    try {
+      const image = await win.webContents.capturePage();
+      if (image && !image.isEmpty()) {
+        const size = image.getSize();
+        const small = size.width > 960 ? image.resize({ width: 960 }) : image;
+        fs.writeFileSync(path.join(DESKTOP_DEBUG_DIR, safeLabel + '.png'), small.toPNG());
+      }
+    } catch (_) { }
+  } catch (error) {
+    console.warn('[DesktopDebug]', label, error && error.message || error);
+  }
+}
+function scheduleDesktopDebug(label, delays = [300], extra = {}) {
+  for (const ms of delays) {
+    setTimeout(() => { desktopDebugSnapshot(`${label}+${ms}ms`, extra).catch(() => {}); }, ms);
+  }
+}
+
+// [二改] 退出桌面模式后，让 Windows 把桌面壁纸重新画一遍。
+// 诊断发现 Mineradio 自己画面正常，黑的是它后面的 Windows 桌面：图标层/壁纸层在
+// Mineradio 离开后没重画，停在黑色。这里：图标列表若被留成不透明黑底就还原成透明，
+// 把当前壁纸原样重设一次（不写注册表），再让桌面所有宿主窗口整体重画。
+const DESKTOP_REFRESH_SCRIPT = `
+$ErrorActionPreference = "Stop"
+Add-Type @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class MineradioDesktopRefresh {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr p);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] public static extern bool RedrawWindow(IntPtr h, IntPtr r, IntPtr g, uint f);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll", EntryPoint="GetWindowLongPtrW")] public static extern IntPtr GetWindowLongPtr(IntPtr h, int i);
+  [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW")] public static extern IntPtr SendMessageTimeout(IntPtr h, uint m, IntPtr w, IntPtr l, uint f, uint t, out IntPtr r);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode, EntryPoint="SystemParametersInfoW")] public static extern bool SpiGet(uint a, uint p, StringBuilder v, uint w);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode, EntryPoint="SystemParametersInfoW")] public static extern bool SpiSet(uint a, uint p, string v, uint w);
+  public static string Run() {
+    StringBuilder log = new StringBuilder();
+    IntPtr list = IntPtr.Zero;
+    var hosts = new System.Collections.Generic.List<IntPtr>();
+    EnumWindows(delegate(IntPtr top, IntPtr u) {
+      StringBuilder c = new StringBuilder(64); GetClassName(top, c, 64);
+      string cls = c.ToString();
+      if (cls == "Progman" || cls == "WorkerW") hosts.Add(top);
+      IntPtr view = FindWindowEx(top, IntPtr.Zero, "SHELLDLL_DefView", null);
+      if (view != IntPtr.Zero && list == IntPtr.Zero) list = FindWindowEx(view, IntPtr.Zero, "SysListView32", null);
+      return true;
+    }, IntPtr.Zero);
+    if (list != IntPtr.Zero) {
+      IntPtr res;
+      SendMessageTimeout(list, 0x1000, IntPtr.Zero, IntPtr.Zero, 2, 500, out res); // LVM_GETBKCOLOR
+      long bk = res.ToInt64() & 0xFFFFFFFF;
+      long ex = GetWindowLongPtr(list, -20).ToInt64();
+      log.Append("listBk=" + bk.ToString("X") + ";listEx=" + ex.ToString("X") + ";");
+      bool layered = (ex & 0x80000) != 0;
+      if (bk == 0 && !layered) {
+        SendMessageTimeout(list, 0x1001, IntPtr.Zero, new IntPtr(unchecked((int)0xFFFFFFFF)), 2, 500, out res); // CLR_NONE
+        log.Append("listBkReset;");
+      }
+    }
+    StringBuilder path = new StringBuilder(1024);
+    if (SpiGet(0x0073, 1024, path, 0)) {
+      bool ok = SpiSet(0x0014, 0, path.ToString(), 0);
+      log.Append("wallpaper=" + (path.Length > 0 ? "file" : "solid") + ";refreshed=" + ok + ";");
+    }
+    foreach (IntPtr h in hosts) RedrawWindow(h, IntPtr.Zero, IntPtr.Zero, 0x0001 | 0x0004 | 0x0080 | 0x0100 | 0x0400);
+    if (list != IntPtr.Zero) RedrawWindow(list, IntPtr.Zero, IntPtr.Zero, 0x0001 | 0x0004 | 0x0100);
+    log.Append("hosts=" + hosts.Count);
+    return log.ToString();
+  }
+}
+"@
+[MineradioDesktopRefresh]::Run()
+`;
+function refreshWindowsDesktopAfterExit(reason = 'exit') {
+  if (process.platform !== 'win32') return Promise.resolve('');
+  return new Promise((resolve) => {
+    try {
+      execFile('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', DESKTOP_REFRESH_SCRIPT], {
+        windowsHide: true, timeout: 8000, maxBuffer: 64 * 1024,
+      }, (error, stdout, stderr) => {
+        const out = String(stdout || '').trim() || String(error && error.message || stderr || '').trim();
+        try {
+          fs.mkdirSync(DESKTOP_DEBUG_DIR, { recursive: true });
+          fs.appendFileSync(path.join(DESKTOP_DEBUG_DIR, 'log.jsonl'), JSON.stringify({ at: new Date().toISOString(), label: 'desktop-refresh', reason, result: out.slice(0, 400) }) + '\n');
+        } catch (_) { }
+        resolve(out);
+      });
+    } catch (error) {
+      resolve(String(error && error.message || error));
+    }
+  });
+}
+
+// [二改] 离开桌面后逼 Chromium 把透明窗口的合成层重建一遍：
+// 重新声明透明背景 + 宽度临时 +1 再还原（重建交换链），再整窗重画。
+function repaintMainWindowAfterDesktopExit(win) {
+  if (!win || win.isDestroyed()) return;
+  const status = fullDesktopModeRuntime.getStatus('repaint-after-exit');
+  if (status.enabled === true) return;
+  try { win.setBackgroundColor('#00000000'); } catch (_) { }
+  try { win.webContents.invalidate(); } catch (_) { }
+  if (win.isMaximized() || win.isFullScreen() || win.isMinimized() || !win.isVisible()) return;
+  try {
+    const b = win.getBounds();
+    win.setBounds({ x: b.x, y: b.y, width: b.width + 1, height: b.height }, false);
+    setTimeout(() => {
+      if (win.isDestroyed()) return;
+      try { win.setBounds(b, false); win.webContents.invalidate(); } catch (_) { }
+    }, 60);
+  } catch (_) { }
+}
+
+async function captureDesktopPuzzleFrame(win) {
+  if (!win || win.isDestroyed()) return '';
+  const image = await win.webContents.capturePage();
+  if (!image || image.isEmpty()) return '';
+  const size = image.getSize();
+  const bounds = win.getContentBounds();
+  // 按窗口的逻辑尺寸缩一下（最宽 2560），编码更快，画面也够清楚
+  const targetWidth = Math.max(1, Math.min(1920, Math.round(bounds.width * Math.min(1.5, screen.getDisplayMatching(bounds).scaleFactor || 1))));
+  const resized = size.width > targetWidth ? image.resize({ width: targetWidth, quality: 'good' }) : image;
+  // JPEG 编码比 PNG 快很多，传给渲染端的数据也小，进出桌面时不卡
+  return 'data:image/jpeg;base64,' + resized.toJPEG(84).toString('base64');
+}
+
+ipcMain.handle('mineradio-desktop-puzzle-capture', async (event) => {
+  if (!isTrustedMainWindowIpc(event)) return { ok: false, error: 'DESKTOP_PUZZLE_UNTRUSTED_SENDER' };
+  try {
+    const dataUrl = await captureDesktopPuzzleFrame(mainWindow);
+    return dataUrl ? { ok: true, dataUrl } : { ok: false, error: 'DESKTOP_PUZZLE_CAPTURE_EMPTY' };
+  } catch (error) {
+    return { ok: false, error: String(error && error.message || error || 'DESKTOP_PUZZLE_CAPTURE_FAILED') };
+  }
+});
 
 async function enableFullDesktopMode(win, options = {}) {
   const enableOperation = ++fullDesktopEnableOperation;
@@ -1453,6 +1724,7 @@ async function enableFullDesktopMode(win, options = {}) {
     await syncWallpaperEngineDesktopIconLayering('enable-settled').catch(() => false);
     fullDesktopModeHostVisibilityTransitionDepth = Math.max(0, fullDesktopModeHostVisibilityTransitionDepth - 1);
     syncWallpaperEngineWithFullDesktopMode(win, 'enable-settled');
+    scheduleDesktopDebug('enter', [2200], { reason: options && options.reason });
     if (fullDesktopModeRuntime.getStatus('enable-settled-cleanup').enabled !== true) {
       releaseFullDesktopModeRecoveryTray();
     }
@@ -1473,6 +1745,7 @@ async function setFullDesktopModeInteractive(value, reason = 'interaction-change
       releaseFullDesktopModeRecoveryTray();
     }
     syncFullDesktopEscapeShortcut(`${reason}-escape`);
+    scheduleDesktopDebug(value === true ? 'to-interactive' : 'to-passive', [400, 1600], { reason });
   }
 }
 
@@ -1498,8 +1771,16 @@ async function disableFullDesktopMode(reason = 'disabled') {
   fullDesktopEnablePending = false;
   fullDesktopModeHostVisibilityTransitionDepth += 1;
   try {
+    await desktopDebugSnapshot('exit-before', { reason });
+    const before = fullDesktopModeRuntime.getStatus(`${reason}-puzzle`);
+    if (DESKTOP_PUZZLE_USER_EXIT_REASONS.has(String(reason))
+      && before.enabled === true && before.interactive === true && before.phase === 'interactive') {
+      // [二改] 先让画面碎成拼图散落，露出原本的桌面，再真正退出
+      await runDesktopPuzzleStep('playOut', 3500);
+    }
     return await fullDesktopModeRuntime.disable(reason);
   } finally {
+    runDesktopPuzzleStep('reset', 1200).catch(() => {});
     // Keep icon layering active until the host is detached back to a verified
     // top-level HWND; only then restore the ordinary host/surface/source chain.
     await syncWallpaperEngineDesktopIconLayering(`${reason}-settled`).catch(() => false);
@@ -1509,6 +1790,11 @@ async function disableFullDesktopMode(reason = 'disabled') {
       releaseFullDesktopModeRecoveryTray();
     }
     syncFullDesktopEscapeShortcut(`${reason}-escape`);
+    setTimeout(() => repaintMainWindowAfterDesktopExit(mainWindow), 120);
+    if (fullDesktopModeRuntime.getStatus(`${reason}-desktop-refresh`).enabled !== true) {
+      refreshWindowsDesktopAfterExit(reason).catch(() => {});
+    }
+    scheduleDesktopDebug('exit-after', [400, 1600, 4000], { reason });
   }
 }
 
@@ -2093,6 +2379,10 @@ function focusMainWindow() {
   markMainWindowExpectedVisible(mainWindow, true, 'focus-main-window');
   const desktopMode = fullDesktopModeRuntime.getStatus('focus-main-window');
   if (desktopMode.enabled === true) {
+    if (desktopMode.interactive === true && desktopMode.softwareInteractionLocked === true) {
+      setDesktopSoftwareUnlocked('focus-main-window');
+      return true;
+    }
     setFullDesktopModeInteractive(true, 'focus-main-window').catch((error) => {
       console.warn('[FullDesktopMode] focus failed:', error && error.message || error);
     });
@@ -2123,6 +2413,11 @@ function createOrUpdateTray() {
   const desktopMode = fullDesktopModeRuntime.getStatus('tray-menu');
   const menu = Menu.buildFromTemplate([
     { label: `显示 ${APP_NAME}`, click: () => focusMainWindow() },
+    {
+      label: '解锁软件操作',
+      visible: desktopMode.enabled === true && desktopMode.softwareInteractionLocked === true,
+      click: () => { setDesktopSoftwareUnlocked('tray-unlock'); },
+    },
     {
       label: '退出完整桌面模式',
       visible: desktopMode.enabled === true,
@@ -3898,10 +4193,19 @@ function positionWallpaperWindow(reason = 'display-change') {
 }
 
 async function createWallpaperWindow(payload = {}) {
+  // [二改] 进入前先拍下当前画面、把 Mineradio 藏起来，挂到桌面后再一片片拼出来
+  const wasEnabled = fullDesktopModeRuntime.getStatus('puzzle-before-enable').enabled === true;
+  const puzzlePrepared = !wasEnabled
+    ? (await runDesktopPuzzleStep('prepareIn', 1800)).ok === true
+    : false;
   const result = await enableFullDesktopMode(mainWindow, {
     interactive: true,
     reason: String(payload && payload.reason || 'renderer-enabled'),
   });
+  if (puzzlePrepared) {
+    const entered = !!(result && result.ok === true && result.enabled === true && result.interactive === true);
+    runDesktopPuzzleStep(entered ? 'playIn' : 'cancel', 4000).catch(() => {});
+  }
   if (result && result.ok === true && result.enabled === true) {
     const backdrop = {
       ok: true,

@@ -306,6 +306,8 @@ function animate() {
     return;
   }
   if (shouldSkipAdaptiveRenderFrame(now)) return;
+  // 主页全屏主题盖住 3D 场景时，场景休眠，省下显卡给主题
+  if (typeof homeThemeCoversScene === 'function' && homeThemeCoversScene()) { prevTime = now; return; }
   var dt = Math.min((now - prevTime) / 1000, 0.05);
   prevTime = now;
   sampleRenderPerf(now, dt);

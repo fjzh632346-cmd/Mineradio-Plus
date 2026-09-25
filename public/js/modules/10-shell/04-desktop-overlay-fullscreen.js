@@ -391,12 +391,15 @@ function consumeDesktopModeControlEvent(event) {
   if (typeof event.stopPropagation === 'function') event.stopPropagation();
 }
 
-function setDesktopIconsVisibility(desired, event) {
+function setDesktopIconsVisibility(desired, event, options) {
+  // [二改] options.quiet：自动显示/隐藏图标时不弹提示
+  var quiet = !!(options && options.quiet);
+  if (event && typeof desktopIconAutoNoteManual === 'function') desktopIconAutoNoteManual();
   consumeDesktopModeControlEvent(event);
   var api = getDesktopWindowApi();
   var mode = desktopIconShieldModeState();
   if (!api || typeof api.setDesktopIconsVisible !== 'function' || !mode.active) {
-    if (typeof showToast === 'function') showToast('当前桌面图标显示控制不可用');
+    if (!quiet && typeof showToast === 'function') showToast('当前桌面图标显示控制不可用');
     return Promise.resolve({ ok: false, error: 'DESKTOP_ICON_VISIBILITY_INACTIVE' });
   }
   if (desktopIconVisibilityPending) return Promise.resolve({ ok: false, error: 'DESKTOP_ICON_VISIBILITY_BUSY' });
@@ -413,7 +416,7 @@ function setDesktopIconsVisibility(desired, event) {
       desktopWallpaperRuntimeState.desktopIconsVisible = desired;
       updateDesktopModeControl(desktopWallpaperRuntimeState);
     }
-    if (typeof showToast === 'function') {
+    if (typeof showToast === 'function' && (!quiet || result.ok !== true)) {
       showToast(result.ok === true
         ? (desired ? '桌面图标已显示' : '桌面图标已隐藏')
         : (desired ? '桌面图标显示失败' : '桌面图标隐藏失败'));
@@ -580,9 +583,11 @@ function desktopControlPointState(x, y) {
   try { rootStyle = window.getComputedStyle(document.documentElement); } catch (_) { }
   var safeTop = rootStyle ? parseFloat(rootStyle.getPropertyValue('--desktop-safe-top')) || 0 : 0;
   var safeRight = rootStyle ? parseFloat(rootStyle.getPropertyValue('--desktop-safe-right')) || 0 : 0;
-  var overRevealEdge = x >= Math.max(0, window.innerWidth - safeRight - 92)
-    && x < Math.max(0, window.innerWidth - safeRight)
-    && y >= safeTop && y < safeTop + 104;
+  // [二改] 和主进程轮询光标的"右上角解锁区"保持一样大（340×160），
+  // 否则光标移到右上角按钮上时渲染端会把鼠标又锁回去
+  var overRevealEdge = x >= Math.max(0, window.innerWidth - 340)
+    && x < window.innerWidth
+    && y >= 0 && y < 160;
   var overHotspot = !!(handle && desktopIconShieldElementVisible(handle, { ignoreAriaHidden: true })
     && desktopPointInClientRect(x, y, handle.getBoundingClientRect()));
   var overPanel = !!(desktopModeControlDockState.open && panel
@@ -1329,6 +1334,10 @@ function applyDesktopWallpaperRuntimeStatus(payload) {
   updateDesktopWallpaperRuntimeControls(desktopWallpaperRuntimeState);
   scheduleDesktopIconShieldReport(!(nextEnabled && status.interactive === true));
   scheduleDesktopPointerRouteReport(null, true);
+  // [二改] 编辑态自动藏桌面图标（见 13-desktop-extras/01-desktop-icon-auto.js）
+  if (typeof desktopIconAutoOnStatus === 'function') {
+    try { desktopIconAutoOnStatus(desktopWallpaperRuntimeState, nextEnabled, status.interactive === true); } catch (_) { }
+  }
   return desktopWallpaperRuntimeState;
 }
 function desktopWallpaperErrorLabel(error) {

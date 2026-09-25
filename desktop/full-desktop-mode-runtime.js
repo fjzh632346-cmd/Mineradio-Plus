@@ -48,6 +48,8 @@ function safeCall(target, method, fallback, ...args) {
   }
 }
 
+// [二改] 从被动桌面（WorkerW）拿回窗口时，顺手让 Explorer 把壁纸重画回那块 WorkerW，
+// 修复"从背景切回应用，背景变黑"。详见脚本里 RefreshDesktopWallpaper。
 function desktopWindowDetachScript(input = {}) {
   const hwnd = String(input.hwnd || '');
   if (!/^\d+$/.test(hwnd)) throw new Error('FULL_DESKTOP_NATIVE_HANDLE_INVALID');
@@ -55,6 +57,7 @@ function desktopWindowDetachScript(input = {}) {
   const y = Math.round(Number(input.y) || 0);
   const width = Math.max(1, Math.round(Number(input.width) || 1));
   const height = Math.max(1, Math.round(Number(input.height) || 1));
+  const restoreExStyle = /^-?\d+$/.test(String(input.exStyle || '')) ? String(input.exStyle) : '';
   return `
 $ErrorActionPreference = "Stop"
 if (-not ("MineradioFullDesktopNative" -as [type])) {
@@ -73,8 +76,32 @@ public static class MineradioFullDesktopNative {
   [DllImport("user32.dll", EntryPoint="SetWindowLongPtrW", SetLastError=true)] private static extern IntPtr SetWindowLongPtr64(IntPtr hWnd, int index, IntPtr value);
   [DllImport("user32.dll", EntryPoint="SetWindowLongW", SetLastError=true)] private static extern IntPtr SetWindowLong32(IntPtr hWnd, int index, IntPtr value);
   [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
+  [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder text, int count);
+  [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool RedrawWindow(IntPtr hWnd, IntPtr updateRect, IntPtr updateRegion, uint flags);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true, EntryPoint="SystemParametersInfoW")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool SystemParametersInfoGet(uint action, uint param, System.Text.StringBuilder value, uint winIni);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true, EntryPoint="SystemParametersInfoW")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool SystemParametersInfoSet(uint action, uint param, string value, uint winIni);
   public static IntPtr GetWindowLongPtr(IntPtr hWnd, int index) { return IntPtr.Size == 8 ? GetWindowLongPtr64(hWnd, index) : GetWindowLong32(hWnd, index); }
   public static IntPtr SetWindowLongPtr(IntPtr hWnd, int index, IntPtr value) { return IntPtr.Size == 8 ? SetWindowLongPtr64(hWnd, index, value) : SetWindowLong32(hWnd, index, value); }
+  public static string ClassOf(IntPtr hWnd) {
+    if (hWnd == IntPtr.Zero) return "";
+    System.Text.StringBuilder text = new System.Text.StringBuilder(128);
+    GetClassName(hWnd, text, text.Capacity);
+    return text.ToString();
+  }
+  // RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW
+  public static void Repaint(IntPtr hWnd) {
+    if (hWnd != IntPtr.Zero && IsWindow(hWnd)) RedrawWindow(hWnd, IntPtr.Zero, IntPtr.Zero, 0x0001 | 0x0004 | 0x0400 | 0x0080 | 0x0100);
+  }
+  // Passive mode hosts Mineradio in the WorkerW spawned by 0x052C. Explorer does
+  // not repaint that WorkerW after the child leaves, so it stays black behind the
+  // transparent Mineradio surface. Re-apply the current wallpaper (no ini write).
+  public static bool RefreshDesktopWallpaper() {
+    System.Text.StringBuilder path = new System.Text.StringBuilder(1024);
+    // SPI_GETDESKWALLPAPER = 0x0073, SPI_SETDESKWALLPAPER = 0x0014
+    if (!SystemParametersInfoGet(0x0073, (uint)path.Capacity, path, 0)) return false;
+    return SystemParametersInfoSet(0x0014, 0, path.ToString(), 0);
+  }
 }
 "@
 }
@@ -83,6 +110,10 @@ try {
   try { $previousDpiContext = [MineradioFullDesktopNative]::SetThreadDpiAwarenessContext([IntPtr]::new([Int64]-4)) } catch { }
   $target = [IntPtr]::new([Int64]${hwnd})
   if (-not [MineradioFullDesktopNative]::IsWindow($target)) { throw "FULL_DESKTOP_TARGET_NOT_FOUND" }
+  $previousParent = [MineradioFullDesktopNative]::GetParent($target)
+  $previousParentClass = [MineradioFullDesktopNative]::ClassOf($previousParent)
+  $previousRoot = [IntPtr]::Zero
+  if ($previousParent -ne [IntPtr]::Zero) { $previousRoot = [MineradioFullDesktopNative]::GetAncestor($previousParent, 2) }
   [MineradioFullDesktopNative]::SetParent($target, [IntPtr]::Zero) | Out-Null
   $GWL_STYLE = -16
   $WS_POPUP = [Int64]0x80000000
@@ -96,6 +127,15 @@ try {
   # still set. Validate the parent only after converting to WS_POPUP.
   $parent = [MineradioFullDesktopNative]::GetParent($target)
   if ($parent -ne [IntPtr]::Zero) { throw "FULL_DESKTOP_DETACH_FAILED" }
+  # Restore the exact extended style Electron created the window with. Being a
+  # child of Explorer can leave layered/transparent bits behind, and a transparent
+  # Electron window then composes its see-through pixels as solid black.
+  $exStyleBefore = [MineradioFullDesktopNative]::GetWindowLongPtr($target, -20).ToInt64()
+  $restoreExStyle = "${restoreExStyle}"
+  if ($restoreExStyle -ne "") {
+    [MineradioFullDesktopNative]::SetWindowLongPtr($target, -20, [IntPtr]::new([Int64]$restoreExStyle)) | Out-Null
+  }
+  $exStyleAfter = [MineradioFullDesktopNative]::GetWindowLongPtr($target, -20).ToInt64()
   if (-not [MineradioFullDesktopNative]::SetWindowPos($target, [IntPtr]::Zero, ${x}, ${y}, ${width}, ${height}, 0x0030)) { throw "FULL_DESKTOP_POSITION_FAILED" }
   $rect = New-Object MineradioFullDesktopNative+RECT
   if (-not [MineradioFullDesktopNative]::GetWindowRect($target, [ref]$rect)) { throw "FULL_DESKTOP_BOUNDS_ACK_FAILED" }
@@ -103,11 +143,25 @@ try {
   $actualHeight = $rect.Bottom - $rect.Top
   if ($actualWidth -le 0 -or $actualHeight -le 0) { throw "FULL_DESKTOP_BOUNDS_ACK_FAILED" }
   if ([Math]::Abs($actualWidth - ${width}) -gt 16 -or [Math]::Abs($actualHeight - ${height}) -gt 16) { throw "FULL_DESKTOP_BOUNDS_ACK_FAILED" }
+  # Repainting the old host is best-effort and must never fail the detach.
+  $wallpaperRefreshed = $false
+  try {
+    [MineradioFullDesktopNative]::Repaint($previousParent)
+    if ($previousRoot -ne $previousParent) { [MineradioFullDesktopNative]::Repaint($previousRoot) }
+    if ($previousParentClass -eq "WorkerW") {
+      $wallpaperRefreshed = [MineradioFullDesktopNative]::RefreshDesktopWallpaper()
+      [MineradioFullDesktopNative]::Repaint($previousParent)
+    }
+  } catch { }
   [pscustomobject]@{
     ok = $true
     targetWindowId = $target.ToInt64().ToString()
     parentWindowId = "0"
     parentClassName = ""
+    previousParentClassName = $previousParentClass
+    wallpaperRefreshed = $wallpaperRefreshed
+    exStyleBefore = $exStyleBefore.ToString()
+    exStyleAfter = $exStyleAfter.ToString()
     style = $verifiedStyle.ToString()
     child = $false
     popup = $true
@@ -202,6 +256,7 @@ try {
   $WS_POPUP = [Int64]0x80000000
   $WS_CHILD = [Int64]0x40000000
   $style = [MineradioDesktopCoexistNative]::GetWindowLongPtr($target, $GWL_STYLE).ToInt64()
+  $originalExStyle = [MineradioDesktopCoexistNative]::GetWindowLongPtr($target, -20).ToInt64()
   $childStyle = ($style -band (-bnot $WS_POPUP)) -bor $WS_CHILD
   [MineradioDesktopCoexistNative]::SetWindowLongPtr($target, $GWL_STYLE, [IntPtr]::new([Int64]$childStyle)) | Out-Null
   [MineradioDesktopCoexistNative]::SetParent($target, $defView) | Out-Null
@@ -233,6 +288,8 @@ try {
     desktopViewWindowId = $defView.ToInt64().ToString()
     desktopListWindowId = $listView.ToInt64().ToString()
     style = $verifiedStyle.ToString()
+    exStyleBefore = $originalExStyle.ToString()
+    exStyleAfter = [MineradioDesktopCoexistNative]::GetWindowLongPtr($target, -20).ToInt64().ToString()
     child = $true
     popup = $false
     actualBounds = [pscustomobject]@{ x = $rect.Left; y = $rect.Top; width = $actualWidth; height = $actualHeight }
@@ -1166,6 +1223,18 @@ class FullDesktopModeRuntime {
       else safeCall(win, 'setIgnoreMouseEvents', null, false);
       this.pointerIgnoreMouseEvents = ignoreMouseEvents;
     }
+    // [二改] 锁定时窗口被设成"不可获得焦点"。Chromium 对不可激活的窗口会把鼠标按下
+    // 当作激活点击直接吞掉（MA_NOACTIVATEANDEAT）——于是右上角能悬停却点不动。
+    // 光标在右上角控制区时临时恢复可获得焦点，离开后再改回去。
+    if (this.softwareInteractionLocked === true) {
+      const wantFocusable = this.pointerRoute.overDesktopControls === true;
+      if (options.force === true || this.lockedFocusable !== wantFocusable) {
+        safeCall(win, 'setFocusable', null, wantFocusable);
+        this.lockedFocusable = wantFocusable;
+      }
+    } else {
+      this.lockedFocusable = null;
+    }
     return ignoreMouseEvents;
   }
 
@@ -1471,6 +1540,10 @@ class FullDesktopModeRuntime {
       || !result.topLevelHostWindowId) {
       throw new Error('FULL_DESKTOP_ICON_HOST_ACK_INVALID');
     }
+    if (this.originalExStyle == null && /^-?\d+$/.test(String(result.exStyleBefore || ''))) {
+      this.originalExStyle = String(result.exStyleBefore);
+    }
+    this.lastNativeAck = { kind: 'attach-coexist', at: Date.now(), exStyleBefore: result.exStyleBefore, exStyleAfter: result.exStyleAfter };
     this.attachment = {
       kind: 'icon-host',
       targetWindowId: String(result.targetWindowId || ''),
@@ -1496,10 +1569,20 @@ class FullDesktopModeRuntime {
       y: bounds.y,
       width: bounds.width,
       height: bounds.height,
+      exStyle: this.originalExStyle == null ? '' : this.originalExStyle,
     });
     if (!result || result.ok !== true
       || (Object.prototype.hasOwnProperty.call(result, 'parentWindowId') && String(result.parentWindowId) !== '0')
       || result.child === true || result.popup === false) throw new Error('FULL_DESKTOP_DETACH_ACK_INVALID');
+    this.lastNativeAck = {
+      kind: 'detach',
+      at: Date.now(),
+      previousParentClassName: result.previousParentClassName,
+      wallpaperRefreshed: result.wallpaperRefreshed,
+      exStyleBefore: result.exStyleBefore,
+      exStyleAfter: result.exStyleAfter,
+      restoredExStyle: this.originalExStyle,
+    };
     this.attachment = null;
     return result;
   }
@@ -1726,6 +1809,8 @@ class FullDesktopModeRuntime {
       this.window = win;
       this.nativeWindowId = nativeWindowHandleDecimal(win);
       this.snapshot = captureBrowserWindowState(win, this.screen);
+      this.originalExStyle = null;
+      this.lastNativeAck = null;
       this.phase = 'enabling';
       const display = this.displaySnapshot(win);
       try {
