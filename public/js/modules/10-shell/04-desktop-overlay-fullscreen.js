@@ -58,6 +58,9 @@ var DESKTOP_ICON_SHIELD_TARGETS = [
   { selector: '#fx-fab-hide-btn', kind: 'fx-launcher-toggle' },
   { selector: '#playlist-panel', kind: 'playlist-panel' },
   { selector: '#empty-home', kind: 'home' },
+  // [修] 主题主页会把 #empty-home 藏起来，主题层和拉绳也要挡住桌面图标的点击
+  { selector: '#home-theme-root.on', kind: 'home' },
+  { selector: '#home-theme-cord .cord-hit', kind: 'home' },
   { selector: '#desktop-titlebar', kind: 'window-controls' },
   { selector: '#fullscreen-diy-zone', kind: 'fullscreen-tools', ignoreAriaHidden: true },
   { selector: '#upload-panel', kind: 'upload-panel' },

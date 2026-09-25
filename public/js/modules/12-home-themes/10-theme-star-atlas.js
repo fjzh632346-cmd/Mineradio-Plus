@@ -315,6 +315,9 @@
     P + ' .sa-ov{pointer-events:none}',
     P + ' .sa-gl{opacity:0;transition:opacity 1.4s ease}',
     P + ' .sa-gl.on{opacity:1}',
+    // [修] 没有 WebGL / 上下文丢了一直没恢复：用一层渐变代替，别是一片纯黑
+    P + '.sa-nogl{background:radial-gradient(60% 45% at 20% 34%,rgba(40,48,78,.35),rgba(0,0,0,0) 70%),linear-gradient(100deg,rgba(0,0,0,0) 36%,rgba(120,120,150,.07) 46%,rgba(170,150,130,.09) 50%,rgba(120,120,150,.06) 54%,rgba(0,0,0,0) 64%),linear-gradient(#060913,#03050b 62%,#010205)}',
+    P + '.sa-nogl .sa-gl{opacity:0}',
     P + ' .sa-ui{position:absolute;inset:0;pointer-events:none}',
     P + ' .sa-ui>*{pointer-events:auto}',
     P + ' button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer;outline:none}',
@@ -396,7 +399,7 @@
     P + ' .sa-dv h2{font-weight:300;font-size:clamp(30px,2.6vw,50px);letter-spacing:.14em;margin:.3em 0 .25em;line-height:1.2}',
     P + ' .sa-dv .sub{font-size:12.5px;letter-spacing:.16em;color:rgba(var(--iv),.45);line-height:1.8}',
     P + ' .sa-dv .sa-acts{margin-top:18px}',
-    P + ' .sa-dv ul{list-style:none;margin:22px 0 0;padding:0 8px 0 0;overflow-y:auto;flex:1;min-height:0;scrollbar-width:thin;scrollbar-color:rgba(var(--iv),.15) transparent;-webkit-mask:linear-gradient(#000 88%,transparent)}',
+    P + ' .sa-dv ul{position:relative;list-style:none;margin:22px 0 0;padding:0 8px 0 0;overflow-y:auto;flex:1;min-height:0;scrollbar-width:thin;scrollbar-color:rgba(var(--iv),.15) transparent;-webkit-mask:linear-gradient(#000 88%,transparent)}',
     P + ' .sa-dv ul::-webkit-scrollbar{width:4px}',
     P + ' .sa-dv ul::-webkit-scrollbar-thumb{background:rgba(var(--iv),.14);border-radius:2px}',
     P + ' .sa-dv li{display:flex;align-items:center;gap:14px;padding:9px 0;border-bottom:1px solid rgba(var(--iv),.06);cursor:pointer;transition:background .3s}',
@@ -447,7 +450,9 @@
     var A = ctx.actions || {};
     var reduced = !!ctx.reducedMotion;
     var destroyed = false, paused = false, raf = 0, lost = false;
-    var DPR = Math.min(window.devicePixelRatio || 1, 1.5);
+    // [修] 缩放比例每次 sizeAll 都重新读（窗口拖到另一块缩放不同的屏幕上）
+    function dprNow() { return Math.min(window.devicePixelRatio || 1, 1.5); }
+    var DPR = dprNow();
     ctx.injectStyle(ID, CSS);
 
     root.innerHTML = [
@@ -688,10 +693,10 @@
         if (s.key === 'polaris') { var lit = model && model.now ? 1 : 0.45; s.b *= lit * (1 + 0.35 * energy); }
         if (on && s.key && EN[s.key] && d2 < bd && !V) { bd = d2; best = { key: s.key, p: p }; }
       }
-      uploadStars();
+      if (gl && !lost) uploadStars();
       if (best) {
         var c = CAT[best.key];
-        elTip.innerHTML = esc(c[4]) + '<span>' + esc(EN[best.key]) + ' · ' + c[2].toFixed(1) + ' 等</span>';
+        setH(elTip, esc(c[4]) + '<span>' + esc(EN[best.key]) + ' · ' + c[2].toFixed(1) + ' 等</span>');
         elTip.style.left = (best.p[0] + 14) + 'px'; elTip.style.top = (best.p[1] - 20) + 'px'; elTip.style.opacity = 1;
       } else elTip.style.opacity = 0;
       return busy;
@@ -877,51 +882,57 @@
       el.classList.toggle('l2', n > 9 && n <= 16);
       el.classList.toggle('l3', n > 16);
     }
+    // [修] 宿主每秒推一次数据：内容没变就不写 DOM（按元素缓存上次写入的字符串）
+    function setH(el, h) { h = String(h); if (el.__saH === h) return false; el.__saH = h; el.innerHTML = h; return true; }
+    function setT(el, t) { t = String(t == null ? '' : t); if (el.__saT === t) return false; el.__saT = t; el.textContent = t; return true; }
+    var elPolSb = elPol.querySelector('.sb'), lastEmpty = null;
     function applyModel(m, force) {
       model = m;
-      var now = m.now;
-      root.classList.toggle('hth-sa-isempty', !now);
+      var now = m.now, ch = false;
+      if (lastEmpty !== !now) { lastEmpty = !now; root.classList.toggle('hth-sa-isempty', !now); ch = true; }
       if (now) {
         if (lastKey && now.key !== lastKey && !force) {
           spawnMeteor('fire');
           elTitle.classList.add('swap');
           clearTimeout(swapTimer);
           swapTimer = setTimeout(function () { if (destroyed) return; setTitle(elTitle, model && model.now ? model.now.title : ''); elTitle.classList.remove('swap'); cacheNp(); }, 480);
-        } else if (elTitle.textContent !== now.title && !elTitle.classList.contains('swap')) setTitle(elTitle, now.title);
+        } else if (elTitle.textContent !== String(now.title || '') && !elTitle.classList.contains('swap')) { setTitle(elTitle, now.title || ''); ch = true; }
         lastKey = now.key;
-        elMeta.innerHTML = esc(now.artist) + (now.album ? '<i>/</i>' + esc(now.album) : '') + (now.providerLabel ? '<em>' + esc(now.providerLabel) + '</em>' : '');
-        elK.textContent = (now.playing ? '正 在 播 放' : '已 暂 停') + ' · 北 极 星';
-        elPP.innerHTML = now.playing ? ICON.pause : ICON.play;
-        elPP.title = now.playing ? '暂停' : '播放'; elPP.setAttribute('aria-label', elPP.title);
+        if (setH(elMeta, esc(now.artist) + (now.album ? '<i>/</i>' + esc(now.album) : '') + (now.providerLabel ? '<em>' + esc(now.providerLabel) + '</em>' : ''))) ch = true;
+        if (setT(elK, (now.playing ? '正 在 播 放' : '已 暂 停') + ' · 北 极 星')) ch = true;
+        if (setH(elPP, now.playing ? ICON.pause : ICON.play)) {
+          elPP.title = now.playing ? '暂停' : '播放'; elPP.setAttribute('aria-label', elPP.title);
+        }
         elLike.classList.toggle('on', !!now.liked);
         elLyr.classList.toggle('on', !!m.lyricsOn);
         posBase = Number(now.position) || 0; posAt = performance.now(); dur = Number(now.duration) || 0; playing = !!now.playing;
-        elTime.textContent = fmt(posBase) + '  /  ' + fmt(dur);
-        var nx = m.next;
-        elNext.style.display = nx ? '' : 'none';
-        if (nx) elNext.innerHTML = '<small>接下来</small>' + esc(nx.title) + (nx.artist ? ' — ' + esc(nx.artist) : '');
-        elPol.querySelector('.sb').textContent = '勾陈一 · ' + (now.playing ? '正在播放' : '已暂停');
+        // [修] 时长未知（0）时显示 --:--，不显示「/ 0:00」
+        setT(elTime, fmt(posBase) + '  /  ' + (dur > 0 ? fmt(dur) : '--:--'));
+        var nx = m.next, nd = nx ? '' : 'none';
+        if (elNext.style.display !== nd) { elNext.style.display = nd; ch = true; }
+        if (nx && setH(elNext, '<small>接下来</small>' + esc(nx.title) + (nx.artist ? ' — ' + esc(nx.artist) : ''))) ch = true;
+        setT(elPolSb, '勾陈一 · ' + (now.playing ? '正在播放' : '已暂停'));
       } else {
         lastKey = null; playing = false; dur = 0;
-        elPol.querySelector('.sb').textContent = '勾陈一 · 等待一首歌';
+        setT(elPolSb, '勾陈一 · 等待一首歌');
       }
       DIPPER.forEach(function (k) {
-        var b = labEls[k];
-        b.querySelector('.n').textContent = entryName(k, m);
-        b.querySelector('.s').textContent = entrySub(k, m);
+        var b = labEls[k], nm = entryName(k, m);
+        if (setT(b.querySelector('.n'), nm)) b.setAttribute('aria-label', nm);
+        setT(b.querySelector('.s'), entrySub(k, m));
         b.classList.toggle('off', !!entryOff(k, m));
-        b.setAttribute('aria-label', entryName(k, m));
       });
-      [].forEach.call(elNav.querySelectorAll('button[data-v]'), function (b) { var k = STAR_OF[b.getAttribute('data-v')]; if (k) b.querySelector('span').textContent = entryName(k, m); });
+      [].forEach.call(elNav.querySelectorAll('button[data-v]'), function (b) { var k = STAR_OF[b.getAttribute('data-v')]; if (k) setT(b.querySelector('span'), entryName(k, m)); });
       var c = m.clock || {}, td = m.today || {};
-      elClockT.textContent = c.time || '';
-      elClockD.textContent = (c.month ? c.month + ' 月 ' + c.day + ' 日' : '') + (c.weekday ? ' · ' + c.weekday : '');
-      elClockS.innerHTML = td.minutes || td.count ? '今天听了<b>' + (td.minutes || 0) + '</b>分钟 · <b>' + (td.count || 0) + '</b>首' + (td.topArtist ? ' · 最常听 <b>' + esc(td.topArtist) + '</b>' : '') : '今天还没有听歌';
-      var q = m.quote || {};
-      elQuote.style.display = q.text ? '' : 'none';
-      elQuote.innerHTML = esc(q.text || '') + (q.source ? '<small>' + esc(q.source) + '</small>' : '');
+      setT(elClockT, c.time || '');
+      setT(elClockD, (c.month ? c.month + ' 月 ' + c.day + ' 日' : '') + (c.weekday ? ' · ' + c.weekday : ''));
+      setH(elClockS, td.minutes || td.count ? '今天听了<b>' + (td.minutes || 0) + '</b>分钟 · <b>' + (td.count || 0) + '</b>首' + (td.topArtist ? ' · 最常听 <b>' + esc(td.topArtist) + '</b>' : '') : '今天还没有听歌');
+      var q = m.quote || {}, qd = q.text ? '' : 'none';
+      if (elQuote.style.display !== qd) elQuote.style.display = qd;
+      setH(elQuote, esc(q.text || '') + (q.source ? '<small>' + esc(q.source) + '</small>' : ''));
       if (V) refreshView(false);
-      cacheNp();
+      // [修] 只有正在播放区的内容变了才重新量位置（offsetTop 会强制排版）
+      if (ch || force) cacheNp();
       requestRender();
     }
     function cacheNp() {
@@ -1004,23 +1015,28 @@
         }
       }
       elDv.innerHTML = h;
-      // 条目变成目标星周围的一团星
-      var sp = catPos(k), r = rng(hashStr(V)), n = Math.min(vItems.length, VMAX), R0 = 0.13 * H, th0 = r() * 6.28;
+      vHl = -1;
+      placeViewStars();
+      [].forEach.call(elNav.querySelectorAll('button[data-v]'), function (b) { b.classList.toggle('cur', b.getAttribute('data-v') === V); });
+      vSig = sigOf(m);
+    }
+    // 条目变成目标星周围的一团星（尺寸变了只重排这团星，不重建页面）
+    // [修] 没有 WebGL 时 stars 是空的：跳过，别抛错
+    function placeViewStars() {
+      var k = STAR_OF[V], sp = catPos(k), r = rng(hashStr(V)), n = Math.min(vItems.length, VMAX), R0 = 0.13 * H, th0 = r() * 6.28;
       elVss.innerHTML = '';
       for (var i = 0; i < VMAX; i++) {
         var s = stars[nStatic + i];
+        if (!s) break;
         if (i < n) {
           var rr = R0 * (0.28 + 0.72 * Math.sqrt((i + 0.6) / (n + 0.6))), th = th0 + i * 2.39996;
           s.x = sp[0] + Math.cos(th) * rr; s.y = sp[1] + Math.sin(th) * rr * 0.82;
           s.tb = 0.95 - Math.min(0.4, i * 0.013); s.s0 = s.size = 17 + (i < 3 ? 6 : 0); s.vi = i;
-          var bt = document.createElement('button'); bt.type = 'button'; bt.className = 'sa-vs'; bt.setAttribute('data-i', i);
+          var bt = document.createElement('button'); bt.type = 'button'; bt.className = 'sa-vs' + (vHl === i ? ' hl' : ''); bt.setAttribute('data-i', i);
           bt.innerHTML = '<span>' + esc(vItems[i].title) + '</span>'; bt.setAttribute('aria-label', vItems[i].title);
           elVss.appendChild(bt);
         } else { s.tb = 0; s.vi = -1; }
       }
-      [].forEach.call(elNav.querySelectorAll('button[data-v]'), function (b) { b.classList.toggle('cur', b.getAttribute('data-v') === V); });
-      vSig = sigOf(m);
-      vHl = -1;
     }
     function sigOf(m) { return V + '|' + VIEWS[V].items(m).map(function (it) { return it.title + ':' + it.sub; }).join('|'); }
     function refreshView() { if (V && model && sigOf(model) !== vSig) { var inp = elDv.querySelector('.srch input'); if (inp && document.activeElement === inp) return; buildView(model); } }
@@ -1033,8 +1049,9 @@
       if (!VIEWS[key] || destroyed) return;
       var fly = !!V && V !== key;
       if (V === key) return;
+      var prevV = V;
       V = key;
-      buildView(model || ctx.model());
+      try { buildView(model || ctx.model()); } catch (err) { console.warn('[star-atlas] view', err); V = prevV; return; }
       root.classList.add('sa-in-dv'); root.setAttribute('data-sa-view', key); elDv.setAttribute('aria-hidden', 'false');
       var b = rotBase(catPos(STAR_OF[key]));
       if (!fly && !reduced) {
@@ -1067,19 +1084,29 @@
       if (u >= 1) { camAnim = null; if (!V) cam = { fx: 0, fy: 0, ax: 0, ay: 0, z: 1 }; }
       return true;
     }
-    function hlItem(i, on) {
+    // [修] 只在从星团悬停过来、且这一条真的不在列表可见区时才滚动；
+    // 鼠标本来就在列表上时不滚（否则内容在光标下移动，会连着触发、一路滚到底）；推近途中星团扫过光标也不滚
+    function hlItem(i, on, fromList) {
       vHl = on ? i : -1;
       [].forEach.call(elDv.querySelectorAll('li[data-i]'), function (li) { li.classList.toggle('hl', on && Number(li.getAttribute('data-i')) === i); });
       [].forEach.call(elVss.children, function (b) { b.classList.toggle('hl', on && Number(b.getAttribute('data-i')) === i); });
-      if (on) { var li = elDv.querySelector('li[data-i="' + i + '"]'); if (li && li.scrollIntoView) { var ul = li.parentNode; if (li.offsetTop < ul.scrollTop || li.offsetTop > ul.scrollTop + ul.clientHeight - 40) ul.scrollTop = li.offsetTop - ul.clientHeight / 2; } }
+      if (on && !fromList && !camAnim) {
+        var li = elDv.querySelector('li[data-i="' + i + '"]'), ul = li && li.parentNode;
+        if (ul && ul.clientHeight) {
+          // 相对列表自身算（ul 已是定位元素，offsetTop 以它为准），底部 12% 被渐隐遮住也算看不见
+          var top = li.offsetTop, bot = top + li.offsetHeight, vt = ul.scrollTop, vb = vt + ul.clientHeight * 0.88;
+          if (top < vt || bot > vb) ul.scrollTop = Math.max(0, top - (ul.clientHeight - li.offsetHeight) / 2);
+        }
+      }
       requestRender();
     }
 
     // ---------- 绘制 ----------
     var ringHover = null, ringR = 44;
     function render(t) {
-      if (!gl || lost) return;
       var e = viewE();
+      // [修] 没有 GL / 上下文丢了也要画叠加层（七个标签、进度环跟着星走），否则全堆在左上角
+      if (!gl || lost) { drawOverlay(e); return; }
       gl.viewport(0, 0, cv.width, cv.height);
       if (!skyF) { gl.clearColor(0.008, 0.01, 0.02, 1); gl.clear(gl.COLOR_BUFFER_BIT); }
       else {
@@ -1167,7 +1194,7 @@
       if (tk) {
         var tp = P(tk); g.strokeStyle = 'rgba(236,222,190,' + (0.35 * e).toFixed(3) + ')'; g.lineWidth = 0.8;
         g.beginPath(); g.arc(tp[0], tp[1], 22, 0, Math.PI * 2); g.stroke();
-        var n = Math.min(vItems.length, VMAX);
+        var n = Math.min(vItems.length, VMAX, Math.max(0, stars.length - nStatic));
         if (vHl >= 0 && vHl < n) {
           var sh = stars[nStatic + vHl], qh = toScr([sh.x, sh.y]), dx2 = qh[0] - tp[0], dy2 = qh[1] - tp[1], dd = Math.hypot(dx2, dy2) || 1;
           g.strokeStyle = 'rgba(236,222,190,.6)'; g.beginPath(); g.arc(qh[0], qh[1], 11, 0, Math.PI * 2); g.stroke();
@@ -1187,12 +1214,14 @@
 
     // ---------- 主循环 ----------
     function requestRender() { needRender = true; if (!raf && !paused && !destroyed) raf = requestAnimationFrame(frame); }
+    var hovBusy = false;
     function frame(nowMs) {
       raf = 0;
       if (destroyed || paused) return;
       var t = (nowMs - t0) / 1000, dt = clamp(t - lastT, 0, 0.1); lastT = t;
-      var baking = jobs.length > 0;
-      if (baking && gl && !lost) runJob();
+      var baking = jobs.length > 0 && !!gl && !lost;
+      if (baking) runJob();
+      if (dprNow() !== DPR) scheduleSize();
       mouse.sx += (mouse.nx - mouse.sx) * Math.min(1, dt * 2.2);
       mouse.sy += (mouse.ny - mouse.sy) * Math.min(1, dt * 2.2);
       var e0 = viewE();
@@ -1202,18 +1231,33 @@
       var e = viewE();
       hoff = [-mouse.sx * 16, -mouse.sy * 6 + e * 0.42 * H]; hAlpha = 1 - 0.9 * e;
       var lifeBusy = stepLife(dt);
-      var eBusy = stepEnergy(dt);
+      stepEnergy(dt);
       var parBusy = Math.abs(mouse.nx - mouse.sx) + Math.abs(mouse.ny - mouse.sy) > 0.002;
-      var hovBusy = stars.length ? lightStars() : false;
-      var busy = baking || camBusy || lifeBusy || eBusy || parBusy || hovBusy || sats.length > 0 || e0 !== e;
+      var moving = mouse.inside && nowMs - mouse.last < 300;
+      // [修] 只有真正的交互/短暂动画才跑满帧：流星、推近/飞行、鼠标刚动过、烘焙、悬停渐变；
+      // 卫星、飞机、音乐起伏走 33ms 的空闲节奏
+      var busy = baking || camBusy || lifeBusy || parBusy || moving || hovBusy || e0 !== e;
       var interval = busy ? 0 : (reduced ? 1e9 : 33);
-      if (needRender || nowMs - lastDraw >= interval - 1) { render(t); lastDraw = nowMs; needRender = false; }
-      if (!reduced || busy || jobs.length) raf = requestAnimationFrame(frame);
+      if (needRender || nowMs - lastDraw >= interval - 1) {
+        // [修] 亮星只在真正要画的帧上计算、上传（hovBusy 留给下一帧判断）
+        hovBusy = stars.length ? lightStars() : false;
+        render(t); lastDraw = nowMs; needRender = false;
+      }
+      if (!reduced || busy || hovBusy) raf = requestAnimationFrame(frame);
     }
 
     // ---------- 尺寸 ----------
-    function sizeAll() {
-      W = Math.max(320, root.clientWidth || window.innerWidth); H = Math.max(240, root.clientHeight || window.innerHeight);
+    var sized = null, resizeTimer = 0;
+    function scheduleSize() {
+      if (destroyed || resizeTimer) return;
+      resizeTimer = setTimeout(function () { resizeTimer = 0; if (!destroyed) sizeAll(); }, 150);
+    }
+    // [修] 宽高和缩放比例都没变就什么也不做（不重新烘焙、不重建）；force 用于上下文恢复
+    function sizeAll(force) {
+      var nw = Math.max(320, root.clientWidth || window.innerWidth), nh = Math.max(240, root.clientHeight || window.innerHeight), nd = dprNow();
+      if (!force && sized && sized[0] === nw && sized[1] === nh && sized[2] === nd) return;
+      sized = [nw, nh, nd];
+      W = nw; H = nh; DPR = nd;
       [cv, ov].forEach(function (c) { c.width = Math.round(W * DPR); c.height = Math.round(H * DPR); });
       L.pole = [0.20 * W, 0.345 * H]; L.S = Math.min(1.45 * H, 0.9 * W);
       // 摇光（最右上那颗）不能钻到右上角窗口按钮和账号区下面：按摆动到最高时的位置限制北斗大小
@@ -1226,7 +1270,12 @@
       if (gl && !lost) {
         if (pending) { freeFbo(pending.sky); freeFbo(pending.hor); pending = null; }
         planBake(); buildStars();
-        if (V) { var k = V; V = null; exitView(true); enterView(k); }
+      }
+      // [修] 推近页不再重建 DOM（搜索框里正在输入的字和焦点都保留），只重排星团、把镜头直接放到新位置
+      if (V) {
+        placeViewStars();
+        var b = rotBase(catPos(STAR_OF[V]));
+        cam = { fx: b[0], fy: b[1], ax: 0.66 * W, ay: 0.47 * H, z: VIEW_Z }; camAnim = null;
       }
       cacheNp();
       requestRender();
@@ -1258,14 +1307,26 @@
       on(b, 'focus', function () { hover = k; requestRender(); });
       on(b, 'blur', function () { if (hover === k) hover = null; });
     });
-    function ringFrac(e) {
+    // [修] 只有环附近一圈（离环 14px 以内）才是拖进度；环里面点一下是播放/暂停
+    function ringHit(e) {
       var r = root.getBoundingClientRect(), pp = toScr(catPos('polaris'));
-      var a = Math.atan2(e.clientY - r.top - pp[1], e.clientX - r.left - pp[0]) + Math.PI / 2;
-      a = a < 0 ? a + Math.PI * 2 : a; return clamp(a / (Math.PI * 2), 0, 0.999);
+      var dx = e.clientX - r.left - pp[0], dy = e.clientY - r.top - pp[1];
+      var a = Math.atan2(dy, dx) + Math.PI / 2;
+      a = a < 0 ? a + Math.PI * 2 : a;
+      return { band: Math.abs(Math.hypot(dx, dy) - ringR) <= 14, frac: clamp(a / (Math.PI * 2), 0, 0.999) };
     }
-    on(elRing, 'pointermove', function (e) { if (model && model.now) { ringHover = ringFrac(e); requestRender(); } });
+    on(elRing, 'pointermove', function (e) {
+      if (!model || !model.now) return;
+      var h = ringHit(e), nh = h.band ? h.frac : null;
+      elRing.title = h.band ? '' : (model.now.playing ? '暂停' : '播放');
+      if (nh !== ringHover) { ringHover = nh; requestRender(); }
+    });
     on(elRing, 'pointerleave', function () { ringHover = null; requestRender(); });
-    on(elRing, 'click', function (e) { if (model && model.now) A.seek(ringFrac(e)); });
+    on(elRing, 'click', function (e) {
+      if (!model || !model.now) return;
+      var h = ringHit(e);
+      if (h.band) A.seek(h.frac); else playMain();
+    });
     on(elTitle, 'click', goImmersive);
     on(elPP, 'click', playMain);
     on($('.sa-prev'), 'click', function () { A.prev(); });
@@ -1300,25 +1361,59 @@
       if (e.key === 'Enter') A.search(inp.value.trim());
       else if (e.key === 'Escape') { if (inp.value) inp.value = ''; else exitView(false); }
     });
-    on(elDv, 'pointerover', function (e) { var li = e.target.closest('li[data-i]'); if (li) hlItem(Number(li.getAttribute('data-i')), true); });
+    on(elDv, 'pointerover', function (e) { var li = e.target.closest('li[data-i]'); if (li) hlItem(Number(li.getAttribute('data-i')), true, true); });
     on(elDv, 'pointerout', function (e) { var li = e.target.closest('li[data-i]'); if (li && !li.contains(e.relatedTarget)) hlItem(Number(li.getAttribute('data-i')), false); });
     on(elVss, 'pointerover', function (e) { var b = e.target.closest('.sa-vs'); if (b) hlItem(Number(b.getAttribute('data-i')), true); });
     on(elVss, 'pointerout', function (e) { var b = e.target.closest('.sa-vs'); if (b) hlItem(Number(b.getAttribute('data-i')), false); });
     on(elVss, 'click', function (e) { var b = e.target.closest('.sa-vs'); if (b && V && VIEWS[V].play) { var i = Number(b.getAttribute('data-i')); if (vItems[i]) VIEWS[V].play(vItems[i], i); } });
     on(elNav, 'click', function (e) { var b = e.target.closest('button[data-v]'); if (!b) return; var k = b.getAttribute('data-v'); if (k === 'home') exitView(false); else enterView(k); });
-    on(window, 'keydown', function (e) { if (V && !paused && e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); exitView(false); } }, true);
-    on(cv, 'webglcontextlost', function (e) { e.preventDefault(); lost = true; });
+    // [修] Esc 不再在 window 捕获阶段抢：冒泡阶段处理，给软件自己的弹窗 / 面板先用。
+    // 捕获阶段只"记下"按下时有没有弹窗或面板开着（软件的全局 Esc 会先把面板关掉，冒泡时就看不出来了），不拦截
+    var escBlocked = false;
+    function appOverlayOpen() {
+      try {
+        if (typeof immersiveMode !== 'undefined' && immersiveMode) return true;
+        if (typeof miniQueueOpen !== 'undefined' && miniQueueOpen) return true;
+        if (typeof shelfManager !== 'undefined' && shelfManager && shelfManager.hasOpenContent && shelfManager.hasOpenContent()) return true;
+        return !!document.querySelector('.modal-mask.show,#hotkey-modal.show,#upload-panel.show,#fx-panel.show,#playlist-panel.show,#playlist-panel.peek:not(.pinned)');
+      } catch (_e) { return false; }
+    }
+    function onEsc(e) {
+      if (e.key !== 'Escape' || !V || paused || destroyed || e.defaultPrevented) return;
+      var t = e.target;
+      // 焦点在主题外面的别的控件上（弹窗、面板里的输入框等）：不管
+      if (t && t.nodeType === 1 && t !== document.body && t !== document.documentElement && !root.contains(t)) return;
+      if (escBlocked || appOverlayOpen()) {
+        // 从「曲目」打开的歌单面板只是 peek 状态，软件的全局 Esc 关不掉它：这里替它收起来，下一次 Esc 再退出推近页
+        var pl = document.getElementById('playlist-panel');
+        if (pl && pl.classList.contains('peek') && !pl.classList.contains('pinned') && !document.querySelector('.modal-mask.show') && typeof closePlaylistPanelSoft === 'function') {
+          e.preventDefault(); e.stopPropagation(); closePlaylistPanelSoft('escape-key');
+        }
+        return;
+      }
+      e.preventDefault(); e.stopPropagation(); exitView(false);
+    }
+    on(window, 'keydown', function (e) { if (e.key === 'Escape') escBlocked = appOverlayOpen(); }, true);
+    on(root, 'keydown', onEsc);
+    on(document, 'keydown', onEsc);
+    // [修] 上下文丢失：约 4 秒还没恢复就换成 CSS 渐变背景（标签照常跟着走）
+    var lostTimer = 0;
+    function setNoGL(v) { root.classList.toggle('sa-nogl', !!v); }
+    on(cv, 'webglcontextlost', function (e) {
+      e.preventDefault(); lost = true; requestRender();
+      clearTimeout(lostTimer); lostTimer = setTimeout(function () { if (!destroyed && lost) setNoGL(true); }, 4000);
+    });
     on(cv, 'webglcontextrestored', function () {
       lost = false; skyF = horF = pending = null; jobs = [];
-      try { initGL(); sizeAll(); } catch (err) { console.warn('[star-atlas] restore', err); }
+      clearTimeout(lostTimer); lostTimer = 0;
+      try { initGL(); setNoGL(false); sizeAll(true); } catch (err) { console.warn('[star-atlas] restore', err); gl = null; setNoGL(true); }
     });
 
     // ---------- 启动 ----------
-    try { initGL(); } catch (err) { console.warn('[star-atlas] WebGL', err); gl = null; }
+    try { initGL(); } catch (err) { console.warn('[star-atlas] WebGL', err); gl = null; setNoGL(true); }
     sizeAll();
     try { applyModel(ctx.model(), true); } catch (err) { console.warn('[star-atlas] model', err); }
 
-    var resizeTimer = 0;
     return {
       // 右键回退：推近的页面里，退回整张星图
       back: function () {
@@ -1329,8 +1424,8 @@
       update: function (m) { if (!destroyed && m) applyModel(m, false); },
       resize: function () {
         if (destroyed) return;
-        clearTimeout(resizeTimer);
-        resizeTimer = setTimeout(function () { if (!destroyed) sizeAll(); }, 150);
+        clearTimeout(resizeTimer); resizeTimer = 0;
+        scheduleSize();
       },
       pause: function () {
         paused = true;
@@ -1346,7 +1441,7 @@
       destroy: function () {
         destroyed = true;
         if (raf) cancelAnimationFrame(raf); raf = 0;
-        clearTimeout(resizeTimer); clearTimeout(swapTimer);
+        clearTimeout(resizeTimer); clearTimeout(swapTimer); clearTimeout(lostTimer);
         listeners.forEach(function (l) { l[0].removeEventListener(l[1], l[2], l[3]); });
         listeners = [];
         if (gl) {
@@ -1358,7 +1453,7 @@
         }
         skyF = horF = pending = null; jobs = []; stars = []; meteors = []; sats = []; trains = [];
         root.innerHTML = '';
-        root.classList.remove('hth-sa-isempty', 'sa-in-dv'); root.removeAttribute('data-sa-view');
+        root.classList.remove('hth-sa-isempty', 'sa-in-dv', 'sa-nogl'); root.removeAttribute('data-sa-view');
       }
     };
   }

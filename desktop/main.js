@@ -1431,9 +1431,14 @@ function unregisterFullDesktopEscapeShortcut() {
   }
 }
 
+// [二改] 渲染端在输入框里打字 / 顶部搜索打开时，请主进程暂时让出 Esc，
+// 免得取消拼音候选、收起搜索时直接退出桌面模式（见 13-desktop-extras/06-desktop-esc-guard.js）
+let fullDesktopEscapeSuspendedByRenderer = false;
 function syncFullDesktopEscapeShortcut(reason = 'desktop-state') {
   const status = fullDesktopModeRuntime.getStatus(reason);
-  if (status.enabled === true || fullDesktopEnablePending === true) registerFullDesktopEscapeShortcut();
+  const active = status.enabled === true || fullDesktopEnablePending === true;
+  if (!active) fullDesktopEscapeSuspendedByRenderer = false;
+  if (active && !fullDesktopEscapeSuspendedByRenderer) registerFullDesktopEscapeShortcut();
   else unregisterFullDesktopEscapeShortcut();
 }
 
@@ -1503,6 +1508,8 @@ function runDesktopPuzzleStep(step, timeoutMs = 2400) {
 // [二改] 桌面模式诊断：每次进出桌面模式，把窗口状态、渲染端状态和一张截图
 // 存到 <程序目录>/_debug_desktop/，方便排查"切回来变黑"。同名截图每次覆盖，日志只留最近一段。
 const DESKTOP_DEBUG_DIR = path.join(app.isPackaged ? STABLE_USER_DATA_PATH : app.getAppPath(), '_debug_desktop');
+// [二改] 诊断只在源码运行时开；打包给别人用的版本默认关（设环境变量 MINERADIO_DESKTOP_DEBUG=1 可强制打开）
+const DESKTOP_DEBUG_ENABLED = process.env.MINERADIO_DESKTOP_DEBUG === '1' || (!app.isPackaged && process.env.MINERADIO_DESKTOP_DEBUG !== '0');
 const DESKTOP_DEBUG_PROBE = `(() => {
   const q = (sel) => document.querySelector(sel);
   const cs = (el) => { if (!el) return null; const s = getComputedStyle(el); return { display: s.display, visibility: s.visibility, opacity: s.opacity, mask: String(s.webkitMaskImage || s.maskImage || '').slice(0, 40), filter: s.filter, transform: s.transform, bg: String(s.backgroundImage || '').slice(0, 60), bgColor: s.backgroundColor }; };
@@ -1532,6 +1539,7 @@ function desktopDebugTrim(file) {
   } catch (_) { }
 }
 async function desktopDebugSnapshot(label, extra = {}) {
+  if (!DESKTOP_DEBUG_ENABLED) return;
   const win = mainWindow;
   if (!win || win.isDestroyed() || appQuitting) return;
   try {
@@ -1575,6 +1583,7 @@ async function desktopDebugSnapshot(label, extra = {}) {
   }
 }
 function scheduleDesktopDebug(label, delays = [300], extra = {}) {
+  if (!DESKTOP_DEBUG_ENABLED) return;
   for (const ms of delays) {
     setTimeout(() => { desktopDebugSnapshot(`${label}+${ms}ms`, extra).catch(() => {}); }, ms);
   }
@@ -1647,7 +1656,7 @@ function refreshWindowsDesktopAfterExit(reason = 'exit') {
         windowsHide: true, timeout: 8000, maxBuffer: 64 * 1024,
       }, (error, stdout, stderr) => {
         const out = String(stdout || '').trim() || String(error && error.message || stderr || '').trim();
-        try {
+        if (DESKTOP_DEBUG_ENABLED) try {
           fs.mkdirSync(DESKTOP_DEBUG_DIR, { recursive: true });
           fs.appendFileSync(path.join(DESKTOP_DEBUG_DIR, 'log.jsonl'), JSON.stringify({ at: new Date().toISOString(), label: 'desktop-refresh', reason, result: out.slice(0, 400) }) + '\n');
         } catch (_) { }
@@ -1770,8 +1779,11 @@ async function disableFullDesktopMode(reason = 'disabled') {
   fullDesktopEnableOperation += 1;
   fullDesktopEnablePending = false;
   fullDesktopModeHostVisibilityTransitionDepth += 1;
+  // [二改] 只有真的在桌面模式里才做拼图 / 重画桌面 / 诊断；
+  // 否则每次启动（页面加载会调一次关闭）都白跑一遍 PowerShell 重设壁纸
+  const wasEnabled = fullDesktopModeRuntime.getStatus(`${reason}-was-enabled`).enabled === true;
   try {
-    await desktopDebugSnapshot('exit-before', { reason });
+    if (wasEnabled) await desktopDebugSnapshot('exit-before', { reason });
     const before = fullDesktopModeRuntime.getStatus(`${reason}-puzzle`);
     if (DESKTOP_PUZZLE_USER_EXIT_REASONS.has(String(reason))
       && before.enabled === true && before.interactive === true && before.phase === 'interactive') {
@@ -1780,7 +1792,7 @@ async function disableFullDesktopMode(reason = 'disabled') {
     }
     return await fullDesktopModeRuntime.disable(reason);
   } finally {
-    runDesktopPuzzleStep('reset', 1200).catch(() => {});
+    if (wasEnabled) runDesktopPuzzleStep('reset', 1200).catch(() => {});
     // Keep icon layering active until the host is detached back to a verified
     // top-level HWND; only then restore the ordinary host/surface/source chain.
     await syncWallpaperEngineDesktopIconLayering(`${reason}-settled`).catch(() => false);
@@ -1790,11 +1802,13 @@ async function disableFullDesktopMode(reason = 'disabled') {
       releaseFullDesktopModeRecoveryTray();
     }
     syncFullDesktopEscapeShortcut(`${reason}-escape`);
-    setTimeout(() => repaintMainWindowAfterDesktopExit(mainWindow), 120);
-    if (fullDesktopModeRuntime.getStatus(`${reason}-desktop-refresh`).enabled !== true) {
-      refreshWindowsDesktopAfterExit(reason).catch(() => {});
+    if (wasEnabled) {
+      setTimeout(() => repaintMainWindowAfterDesktopExit(mainWindow), 120);
+      if (fullDesktopModeRuntime.getStatus(`${reason}-desktop-refresh`).enabled !== true) {
+        refreshWindowsDesktopAfterExit(reason).catch(() => {});
+      }
+      scheduleDesktopDebug('exit-after', [400, 1600, 4000], { reason });
     }
-    scheduleDesktopDebug('exit-after', [400, 1600, 4000], { reason });
   }
 }
 
@@ -4195,9 +4209,13 @@ function positionWallpaperWindow(reason = 'display-change') {
 async function createWallpaperWindow(payload = {}) {
   // [二改] 进入前先拍下当前画面、把 Mineradio 藏起来，挂到桌面后再一片片拼出来
   const wasEnabled = fullDesktopModeRuntime.getStatus('puzzle-before-enable').enabled === true;
-  const puzzlePrepared = !wasEnabled
-    ? (await runDesktopPuzzleStep('prepareIn', 1800)).ok === true
-    : false;
+  let puzzlePrepared = false;
+  if (!wasEnabled) {
+    const prep = await runDesktopPuzzleStep('prepareIn', 1800);
+    puzzlePrepared = !!(prep && prep.ok === true);
+    // [二改] 准备没成功（包括超时）也要发 cancel：渲染端的截图可能晚到，不取消就会把界面一直藏着
+    if (!puzzlePrepared && !(prep && prep.skipped === true)) runDesktopPuzzleStep('cancel', 1200).catch(() => {});
+  }
   const result = await enableFullDesktopMode(mainWindow, {
     interactive: true,
     reason: String(payload && payload.reason || 'renderer-enabled'),
@@ -4300,6 +4318,13 @@ ipcMain.on('mineradio-full-desktop-icon-shields', (event, payload = {}) => {
 ipcMain.handle('mineradio-full-desktop-set-icons-visible', async (event, visible) => {
   if (!isTrustedMainWindowIpc(event)) return { ok: false, error: 'DESKTOP_MODE_UNTRUSTED_SENDER' };
   return fullDesktopModeRuntime.setDesktopIconsVisible(visible !== false, 'renderer-icons-visible');
+});
+
+ipcMain.handle('mineradio-full-desktop-suspend-escape', async (event, suspended) => {
+  if (!isTrustedMainWindowIpc(event)) return { ok: false, error: 'DESKTOP_MODE_UNTRUSTED_SENDER' };
+  fullDesktopEscapeSuspendedByRenderer = suspended === true;
+  syncFullDesktopEscapeShortcut('renderer-escape-suspend');
+  return { ok: true, suspended: fullDesktopEscapeSuspendedByRenderer, registered: fullDesktopEscapeRegistered === true };
 });
 
 ipcMain.handle('mineradio-full-desktop-set-software-lock', async (event, locked) => {

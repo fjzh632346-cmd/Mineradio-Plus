@@ -16,6 +16,8 @@ var homeThemeHost = {
   stage: null,
   visible: false,
   switching: false,
+  pending: '',        // 动画切换进行中时要切到的主题（连续拉绳按它往下算）
+  switchTimer: 0,
   unsubscribe: null,
   tickTimer: 0,
   styles: Object.create(null),
@@ -202,6 +204,8 @@ function syncHomeThemeVisibility() {
     if (homeThemeHost.current === 'classic' && homeThemeHost.instance) destroyHomeThemeInstance();
   }
   syncHomeThemeBackdrop();
+  // QQ 退出 / 换号时清掉上一个账号的歌单数据（换号会自动重新加载）
+  if (typeof homeThemeCheckQQAccount === 'function') homeThemeCheckQQAccount();
   if (homeShown && homeThemeLoggedIn('qq')) homeThemeLoadQQPool(false);
 }
 
@@ -283,7 +287,12 @@ function syncHomeThemeBackdrop() {
 function setHomeTheme(id, opts) {
   opts = opts || {};
   if (!homeThemeDef(id)) id = 'classic';
-  if (id === homeThemeHost.current && !opts.force) return;
+  // 有切换在路上时，和"将要切到的"比，而不是和还没换掉的 current 比
+  var target = homeThemeHost.switchTimer ? homeThemeHost.pending : homeThemeHost.current;
+  if (id === target && !opts.force) return;
+  // 连续切换：上一次还没落地的直接作废，只保留最后一次
+  if (homeThemeHost.switchTimer) { clearTimeout(homeThemeHost.switchTimer); homeThemeHost.switchTimer = 0; }
+  homeThemeHost.pending = '';
   writeHomeThemePreference(id);
   var apply = function () {
     homeThemeHost.current = id;
@@ -296,15 +305,21 @@ function setHomeTheme(id, opts) {
   var root = homeThemeHost.root;
   if (opts.animate && root && homeThemeHost.visible && !homeThemeReducedMotion()) {
     homeThemeHost.switching = true;
+    homeThemeHost.pending = id;
     root.classList.add('switching');
-    setTimeout(function () {
+    homeThemeHost.switchTimer = setTimeout(function () {
+      homeThemeHost.switchTimer = 0;
+      homeThemeHost.pending = '';
       apply();
       requestAnimationFrame(function () {
+        if (homeThemeHost.switchTimer) return; // 又有新的切换开始了，淡出态留给它
         root.classList.remove('switching');
         homeThemeHost.switching = false;
       });
     }, 320);
   } else {
+    if (root) root.classList.remove('switching');
+    homeThemeHost.switching = false;
     apply();
   }
   var def = homeThemeDef(id);
@@ -313,7 +328,9 @@ function setHomeTheme(id, opts) {
 
 function cycleHomeTheme() {
   var ids = homeThemeRegistry.map(function (t) { return t.id; });
-  var idx = ids.indexOf(homeThemeHost.current);
+  // 上一次拉绳的切换还没落地时，从它的目标往下数，免得两次拉绳算出同一个"下一套"
+  var base = homeThemeHost.switchTimer && homeThemeHost.pending ? homeThemeHost.pending : homeThemeHost.current;
+  var idx = ids.indexOf(base);
   setHomeTheme(ids[(idx + 1) % ids.length], { animate: true, toast: true });
 }
 
@@ -409,7 +426,13 @@ function createHomeThemeCord() {
   hit.addEventListener('pointercancel', release);
   hit.addEventListener('click', function (e) { e.stopPropagation(); });
   hit.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); state.fired = false; state.vLen = 9; kick(); setTimeout(trigger, 140); }
+    if (e.key === 'Enter' || e.key === ' ') {
+      // 拦住冒泡，不然空格还会触发全局的"播放 / 暂停"
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.repeat) return;
+      state.fired = false; state.vLen = 9; kick(); setTimeout(trigger, 140);
+    }
   });
   draw();
 }

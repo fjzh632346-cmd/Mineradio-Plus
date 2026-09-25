@@ -46,16 +46,19 @@
   function rng(seed) { var s = (seed * 2654435761) >>> 0 || 1; return function () { s ^= s << 13; s >>>= 0; s ^= s >>> 17; s ^= s << 5; s >>>= 0; return s / 4294967296; }; }
 
   // ---------------- 兜底封面：按歌名 hash 生成"夜色电台"风格小画 ----------------
-  var fbCache = Object.create(null);
-  var fbTint = Object.create(null);
+  // 模块级缓存：限制条数，最旧的先丢（每首歌每个尺寸一张 dataURL，不设上限会一直涨）
+  var FB_MAX = 60;
+  var fbCache = Object.create(null), fbOrder = [];
+  function fbKeyOf(track) { return (track && (track.key || track.title)) || 'mineradio'; }
+  // 兜底封面的主色只由歌名 hash 决定，直接算，不用缓存
+  function fbTintOf(track) { var hs = hash(fbKeyOf(track)); return hsl2rgb((hs % 360) / 360, 0.9, 0.66); }
   function fallbackCover(track, size) {
     size = size || 160;
-    var key = (track && (track.key || track.title)) || 'mineradio';
+    var key = fbKeyOf(track);
     var ck = key + '@' + size;
     if (fbCache[ck]) return fbCache[ck];
     var hs = hash(key), r = rng(hs % 100000 + 7), hue = (hs % 360) / 360;
     var c1 = hsl2rgb(hue, 0.9, 0.66), c2 = hsl2rgb((hue + 0.1) % 1, 0.7, 0.5), c3 = hsl2rgb((hue + 0.6) % 1, 0.45, 0.2), bg = hsl2rgb((hue + 0.62) % 1, 0.5, 0.04);
-    fbTint[key] = c1;
     var c = document.createElement('canvas'); c.width = c.height = size;
     var g = c.getContext('2d');
     g.fillStyle = rgba(bg, 1); g.fillRect(0, 0, size, size);
@@ -108,7 +111,10 @@
     vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,.5)'); g.fillStyle = vg; g.fillRect(0, 0, size, size);
     var url = '';
     try { url = c.toDataURL('image/jpeg', 0.88); } catch (_e) { url = ''; }
-    fbCache[ck] = url;
+    if (url) {
+      fbCache[ck] = url; fbOrder.push(ck);
+      while (fbOrder.length > FB_MAX) delete fbCache[fbOrder.shift()];
+    }
     return url;
   }
 
@@ -179,7 +185,8 @@
     P + ' .fm-refl{position:absolute;left:0;right:0;top:calc(100% + var(--u)*4);height:calc(var(--u)*46);overflow:hidden;opacity:.2;-webkit-mask-image:linear-gradient(180deg,#000,transparent);mask-image:linear-gradient(180deg,#000,transparent);pointer-events:none}',
     P + ' .fm-refl img{width:100%;height:calc(var(--u)*168);object-fit:cover;transform:scaleY(-1);filter:blur(2px);display:block}',
     P + ' .fm-meta{flex:1;min-width:0;display:flex;flex-direction:column}',
-    P + ' .fm-title{font-family:var(--song);font-weight:700;font-size:calc(var(--u)*30);line-height:1.22;color:var(--ink);letter-spacing:.02em;text-shadow:0 0 calc(var(--u)*16) rgba(255,190,140,.25);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-all}',
+    // 歌名：中文照常逐字换行，英文单词只有一行放不下时才拆（原来 break-all 会把单词从中间断开）
+    P + ' .fm-title{font-family:var(--song);font-weight:700;font-size:calc(var(--u)*30);line-height:1.22;color:var(--ink);letter-spacing:.02em;text-shadow:0 0 calc(var(--u)*16) rgba(255,190,140,.25);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:break-word;line-break:strict}',
     P + ' .fm-title[data-act]{cursor:pointer;transition:color .2s,text-shadow .2s}',
     P + ' .fm-title[data-act]:hover{color:#fff;text-shadow:0 0 calc(var(--u)*22) rgba(255,170,110,.6)}',
     P + ' .fm-title[data-act]::after{content:"  ⤢ 沉浸";font-family:var(--mono);font-size:calc(var(--u)*11);letter-spacing:.2em;color:var(--amber);opacity:0;transition:opacity .2s}',
@@ -601,17 +608,19 @@
         img.src = fallbackCover({ key: img.getAttribute('data-fb') || 'x' }, Number(img.getAttribute('data-fbs')) || 160);
       }, true);
 
-      var tintCache = Object.create(null), tintImgs = [];
+      var tintCache = Object.create(null), tintOrder = [], tintImgs = [];
+      function dropTintImg(img) { var k = tintImgs.indexOf(img); if (k >= 0) tintImgs.splice(k, 1); }
       function sampleTint(track, cb) {
         if (!track) return cb(null);
         var url = track.cover || '';
-        if (!url) { fallbackCover(track, 160); return cb(fbTint[track.key || track.title] || null); }
+        if (!url) return cb(fbTintOf(track));
         if (tintCache[url]) return cb(tintCache[url]);
         var img = new Image();
         tintImgs.push(img);
         if (!/^data:/i.test(url)) img.crossOrigin = 'anonymous';
         img.onload = function () {
           img.onload = img.onerror = null;
+          dropTintImg(img);
           if (destroyed) return;
           var c = null;
           try {
@@ -625,10 +634,13 @@
             }
             c = vivid([r / wsum, gg / wsum, b / wsum]);
           } catch (_e) { c = null; }
-          if (c) tintCache[url] = c;
+          if (c) {
+            tintCache[url] = c; tintOrder.push(url);
+            while (tintOrder.length > FB_MAX) delete tintCache[tintOrder.shift()];
+          }
           cb(c);
         };
-        img.onerror = function () { img.onload = img.onerror = null; if (!destroyed) { fallbackCover(track, 160); cb(fbTint[track.key || track.title] || null); } };
+        img.onerror = function () { img.onload = img.onerror = null; dropTintImg(img); if (!destroyed) cb(fbTintOf(track)); };
         img.src = url;
       }
       var tintSig = ['', '', '', '', '', ''];
@@ -664,6 +676,15 @@
         var n = M.now;
         return (n.playing ? 'ON AIR · 正在播放' : 'ON AIR · 上次停在 ' + mss(n.position)) + (n.providerLabel ? ' · ' + n.providerLabel : '');
       }
+      // 队列里还剩几首：模型里的 queue 只截了前 6 首，优先用模型给的总数
+      function queueLeft() {
+        var shown = (M && M.queue || []).length;
+        if (M && typeof M.queueTotal === 'number' && isFinite(M.queueTotal)) return Math.max(0, M.queueTotal);
+        try {
+          if (typeof playQueue !== 'undefined' && playQueue && playQueue.length) return Math.max(shown, playQueue.length - 1);
+        } catch (_e) { }
+        return shown;
+      }
       function plateHint(n) { return n.playing ? '点唱片 · <b>暂停</b>' : (n.position > 1 ? '点唱片 · 从 <b>' + mss(n.position) + '</b> 继续' : '点唱片 · <b>开始播放</b>'); }
       function progHTML(i) {
         var id = STATIONS[i].id;
@@ -681,7 +702,7 @@
             '<div class="fm-np"><div class="fm-plate" data-act="resume" title="' + (n.playing ? '暂停' : '继续播放') + '">' + imgTag(n, 400) + '<div class="fm-pi">' + (n.playing ? I.pause : I.play) + '</div><div class="fm-refl">' + imgTag(n, 400) + '</div></div>' +
             '<div class="fm-meta"><div class="fm-title" data-act="immersive" title="进入沉浸模式">' + esc(n.title) + '</div><div class="fm-who">' + esc(n.artist) + (n.album ? '<i>/</i>《' + esc(n.album) + '》' : '') + '</div>' +
             '<div class="fm-plate-hint" data-live="hint">' + plateHint(n) + '</div></div></div>' +
-            (qn.length ? '<div class="fm-qu"><div class="fm-src">接下来 · <b>队列里还有 ' + (M.queue || []).length + ' 首</b></div><div class="fm-list" style="margin-top:calc(var(--u)*4)">' +
+            (qn.length ? '<div class="fm-qu"><div class="fm-src">接下来 · <b>队列里还有 ' + queueLeft() + ' 首</b></div><div class="fm-list" style="margin-top:calc(var(--u)*4)">' +
               qn.map(function (t, j) { return row(t, '<span class="at">' + String(j + 1).padStart(2, '0') + '</span>', null, 'queue:' + j); }).join('') + '</div></div>' : '');
         }
         if (id === 'daily') {
@@ -729,7 +750,7 @@
       function sigOf(i) {
         if (!M) return '';
         var id = STATIONS[i].id;
-        if (id === 'cont') return M.now ? ['now', M.now.key, M.now.title, M.now.artist, M.now.album, (M.now.cover || '').length, M.now.providerLabel, trackSig(M.queue, 3), (M.queue || []).length].join('|') : 'empty';
+        if (id === 'cont') return M.now ? ['now', M.now.key, M.now.title, M.now.artist, M.now.album, (M.now.cover || '').length, M.now.providerLabel, trackSig(M.queue, 3), queueLeft()].join('|') : 'empty';
         if (id === 'daily') return [M.daily.label, M.daily.kind, M.daily.count, trackSig(M.daily.preview, 4)].join('|');
         if (id === 'rec') return trackSig(M.recent, 5);
         if (id === 'lib') return [M.library.playlistCount, M.library.label, (M.library.platforms || []).join(','), M.login.any].join('|');
@@ -797,7 +818,8 @@
       on(el.stations, 'click', function (e) { var b = e.target.closest('.fm-st'); if (b) tuneTo(Number(b.getAttribute('data-st'))); });
       // 搜索：只收集文字，回车交给软件自己的搜索面板
       function submitSearch() { var v = el.input.value.trim(); if (v) { A.search(v); el.input.value = ''; el.input.blur(); } else el.input.focus(); }
-      on(el.input, 'keydown', function (e) { e.stopPropagation(); if (e.key === 'Enter') submitSearch(); else if (e.key === 'Escape') el.input.blur(); });
+      // 输入法选词时的回车不算提交
+      on(el.input, 'keydown', function (e) { e.stopPropagation(); if (e.key === 'Enter' && !e.isComposing) submitSearch(); else if (e.key === 'Escape' && !e.isComposing) el.input.blur(); });
       on(el.input, 'focus', function () { el.seek.classList.add('focus'); });
       on(el.input, 'blur', function () { el.seek.classList.remove('focus'); });
       on(root.querySelector('.fm-tag'), 'click', function (e) { e.preventDefault(); submitSearch(); });
@@ -838,16 +860,34 @@
         if (RM) { st.f = st.target = STATIONS[nearest(st.f)[0]].f; renderStatic(); }
       }
       on(el.dial, 'pointerup', endDrag); on(el.dial, 'pointercancel', endDrag);
-      on(window, 'keydown', function (e) {
-        if (paused || destroyed || !root.isConnected) return;
+      // ← → 换台：软件全局快捷键（document 冒泡阶段，← → = 上一首/下一首）会先吃掉方向键，
+      // 所以这里挂在 document 的捕获阶段，只在主题可见、没有弹窗、焦点不在输入框时接管
+      function appOverlayOpen() {
+        try { if (typeof hotkeyCaptureState !== 'undefined' && hotkeyCaptureState) return true; } catch (_e) { }
+        if (document.querySelector('.modal-mask.show,.hotkey-modal.show')) return true;
+        try { if (typeof miniQueueOpen !== 'undefined' && miniQueueOpen) return true; } catch (_e) { }
+        try { if (typeof shelfManager !== 'undefined' && shelfManager && shelfManager.hasOpenContent && shelfManager.hasOpenContent()) return true; } catch (_e) { }
+        return false;
+      }
+      function themeActive() {
+        if (paused || destroyed || !root.isConnected) return false;
+        try {
+          if (typeof homeThemeHost !== 'undefined' && (!homeThemeHost.visible || homeThemeHost.switching || homeThemeHost.instanceId !== ID)) return false;
+        } catch (_e) { }
+        return true;
+      }
+      on(document, 'keydown', function (e) {
+        if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+        if (e.ctrlKey || e.altKey || e.metaKey || e.shiftKey || e.isComposing) return;
+        if (!themeActive()) return;
         var t = e.target;
-        if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
-        if (t && t !== document.body && t !== document.documentElement && !root.contains(t)) return;
-        if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
-          tuneTo(nearest(st.target)[0] + (e.key === 'ArrowRight' ? 1 : -1));
-          e.preventDefault();
-        }
-      });
+        if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable || (t.closest && t.closest('[contenteditable="true"]')))) return;
+        if (t && t !== document.body && t !== document.documentElement && !root.contains(t) && !(t.closest && t.closest('#home-theme-cord'))) return;
+        if (appOverlayOpen()) return;
+        e.preventDefault();
+        e.stopPropagation();
+        tuneTo(nearest(st.target)[0] + (e.key === 'ArrowRight' ? 1 : -1));
+      }, true);
       var rootRectLeft = 0;
       function rootLeft() { return rootRectLeft; }
 
@@ -917,10 +957,27 @@
 
       // ---------- WebGL 背景 ----------
       var G = null;
+      var GL_FALLBACK_BG = 'radial-gradient(120% 80% at 50% 30%,#2a1418,#070406 70%)';
       try { G = createGL(el.gl); } catch (e) { console.warn('[fm-dial] webgl', e); G = null; }
-      if (!G) el.gl.style.background = 'radial-gradient(120% 80% at 50% 30%,#2a1418,#070406 70%)';
+      if (!G) el.gl.style.background = GL_FALLBACK_BG;
       if (G) {
-        on(el.gl, 'webglcontextlost', function (e) { e.preventDefault(); if (G) G.lost = true; });
+        // 显卡重置 / 睡眠唤醒会丢上下文：丢失期间先垫一层渐变，恢复后重建着色器和缓冲
+        // （丢失的画布浏览器会画成白底 / 破图，所以把画布藏起来，渐变垫在主题根节点上）
+        on(el.gl, 'webglcontextlost', function (e) {
+          e.preventDefault(); if (G) G.lost = true;
+          el.gl.style.visibility = 'hidden'; root.style.background = GL_FALLBACK_BG;
+        });
+        on(el.gl, 'webglcontextrestored', function () {
+          if (destroyed) return;
+          var NG = null;
+          try { NG = createGL(el.gl); } catch (e) { console.warn('[fm-dial] webgl restore', e); NG = null; }
+          if (!NG) return; // 重建失败就一直用渐变兜底
+          G = NG;
+          el.gl.style.visibility = ''; root.style.background = '';
+          sizeGL();
+          if (paused) return;
+          if (RM) renderStatic(); else kick();
+        });
       }
       var dialY = 0.3;
       function sizeGL() {
@@ -1263,7 +1320,7 @@
           if (G) { G.dispose(); G = null; }
           tickLayer = null;
           root.innerHTML = '';
-          root.style.removeProperty('--acc'); root.style.removeProperty('--acc2');
+          root.style.removeProperty('--acc'); root.style.removeProperty('--acc2'); root.style.background = '';
         },
         // 测试用：直接把指针放到某个频率
         _debug: { st: st, tuneTo: tuneTo },

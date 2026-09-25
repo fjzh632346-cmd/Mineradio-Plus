@@ -21,7 +21,10 @@
     W: 0,
     H: 0,
     resolveRun: null,
-    outPromise: null
+    outPromise: null,
+    // 兜底：rAF 被暂停（窗口被当成不可见）时，到点强制收尾，不让真实画面一直藏着
+    inSafetyMs: 5000,
+    outSafetyMs: 4000
   };
 
   function reducedMotion() {
@@ -176,7 +179,10 @@
       c.translate(PAD - p.bx, PAD - p.by);
       c.save();
       c.clip(path);
-      c.drawImage(full, 0, 0, full.width, full.height, 0, 0, W, H);
+      // 只从整张画面里裁这一块的外接框（已含凸起），不再每块都画整屏——4K 下快很多
+      var sx0 = Math.max(0, Math.floor(p.bx * dpr)), sy0 = Math.max(0, Math.floor(p.by * dpr));
+      var sx1 = Math.min(full.width, Math.ceil((p.bx + p.bw) * dpr)), sy1 = Math.min(full.height, Math.ceil((p.by + p.bh) * dpr));
+      if (sx1 > sx0 && sy1 > sy0) c.drawImage(full, sx0, sy0, sx1 - sx0, sy1 - sy0, sx0 / dpr, sy0 / dpr, (sx1 - sx0) / dpr, (sy1 - sy0) / dpr);
       // 立体边：左上一道亮、右下一道暗
       c.lineJoin = 'round';
       c.translate(-0.8, -0.8);
@@ -213,6 +219,7 @@
       document.body.appendChild(cv);
       st.overlay = cv;
     }
+    cv.classList.remove('dpz-fade'); // 进场刚淡出就退出时，复用的画布还带着淡出态，散落会看不见
     cv.width = Math.round(v.W * dpr); cv.height = Math.round(v.H * dpr);
     st.ctx = cv.getContext('2d');
     st.dpr = dpr; st.W = v.W; st.H = v.H;
@@ -277,7 +284,10 @@
   function prepareIn() {
     stopRun();
     if (reducedMotion()) return Promise.resolve({ ok: false, skipped: 'reduced-motion' });
+    var token = st.token;
     return captureFrame().then(function (img) {
+      // 截图回来得太晚：主进程已超时并 cancel / reset 过了，就别再把画面藏起来
+      if (token !== st.token) return { ok: false, interrupted: true };
       st.snapshot = img;
       injectStyle();
       setMask(); // 挂上桌面那一刻什么都不露，只看到原本的桌面
@@ -285,10 +295,43 @@
     });
   }
 
+  // 跑一段动画，外面套一个定时兜底：到点还没结束就调 onTimeout 收尾
+  function withSafety(run, ms, onTimeout) {
+    return new Promise(function (resolve) {
+      var done = false;
+      var timer = setTimeout(function () {
+        if (done) return;
+        done = true;
+        var r;
+        try { r = onTimeout(); } catch (_) { r = { ok: false, forced: true }; }
+        resolve(r);
+      }, ms);
+      function settle(r) { if (done) return; done = true; clearTimeout(timer); resolve(r); }
+      run().then(settle, function (error) { settle({ ok: false, error: String(error && error.message || error) }); });
+    });
+  }
+  // 停掉当前这一轮（不回调 resolveRun，由兜底自己 resolve）
+  function abandonRun() {
+    st.token += 1;
+    if (st.raf) cancelAnimationFrame(st.raf);
+    st.raf = 0;
+    st.resolveRun = null;
+  }
+  // 进场兜底：直接露出真实画面、拿掉拼图层
+  function forceFinishIn(token) {
+    if (token !== st.token) return { ok: false, interrupted: true };
+    abandonRun();
+    finishIn();
+    return { ok: true, forced: true };
+  }
+
   function playIn() {
     if (!document.body.classList.contains('dpz-masking')) return Promise.resolve({ ok: false, skipped: true });
     stopRun();
     var token = st.token;
+    return withSafety(function () { return runIn(token); }, st.inSafetyMs, function () { return forceFinishIn(token); });
+  }
+  function runIn(token) {
     // 等布局换成全屏、第一帧画出来
     return wait(140).then(nextFrame).then(function () {
       if (token !== st.token) return { ok: false, interrupted: true };
@@ -363,12 +406,14 @@
         st.raf = requestAnimationFrame(frame);
       });
     }).catch(function (error) {
-      finishIn();
+      if (token === st.token) finishIn();
       return { ok: false, error: String(error && error.message || error) };
     });
   }
   function finishIn() {
     clearMask();
+    var shell = document.getElementById('desktop-window-shell');
+    if (shell && shell.style && shell.style.opacity === '0') shell.style.opacity = '';
     removeOverlay();
     st.snapshot = null;
     st.pieces = null;
@@ -383,13 +428,19 @@
   function playOut() {
     // 连按两次退出时，第二次直接等第一次的动画，不重新拍一张"已经藏起来"的画面
     if (st.outPromise) return st.outPromise;
-    st.outPromise = playOutInner().then(function (r) { st.outPromise = null; return r; }, function (e) { st.outPromise = null; throw e; });
-    return st.outPromise;
-  }
-  function playOutInner() {
     stopRun();
-    if (reducedMotion()) return Promise.resolve({ ok: false, skipped: 'reduced-motion' });
     var token = st.token;
+    // 兜底：到点不管动画走到哪都放行（遮罩 / 拼图层留给随后的 reset 收拾）
+    var p = withSafety(function () { return playOutInner(token); }, st.outSafetyMs, function () {
+      if (token === st.token) abandonRun();
+      return { ok: true, forced: true };
+    });
+    var q = p.then(function (r) { if (st.outPromise === q) st.outPromise = null; return r; });
+    st.outPromise = q;
+    return q;
+  }
+  function playOutInner(token) {
+    if (reducedMotion()) return Promise.resolve({ ok: false, skipped: 'reduced-motion' });
     // 散落时把桌面图标先还回来，碎片落下去正好露出完整的桌面
     try {
       if (typeof setDesktopIconsVisibility === 'function' && typeof desktopIconsAreVisible === 'function'
@@ -480,13 +531,20 @@
     } catch (_) { }
     removeOverlay();
     st.snapshot = null; st.pieces = null;
-    if (body && body.classList.contains('dpz-masking')) {
-      clearMask();
-      if (!desktopWindowReducedMotion || !desktopWindowReducedMotion()) {
+    var wasMasked = !!(body && body.classList.contains('dpz-masking'));
+    finishIn(); // 不管之前是什么状态，一律把真实画面还回来
+    if (wasMasked) {
+      var rm = false;
+      try { rm = typeof desktopWindowReducedMotion === 'function' && desktopWindowReducedMotion(); } catch (_) { }
+      if (!rm) {
         body.classList.add('desktop-window-restoring');
         setTimeout(function () { body.classList.remove('desktop-window-restoring'); }, 300);
       }
     }
+    // 退出失败（还停在桌面编辑态）时，散落前强制显示的桌面图标要重新按自动规则藏起来
+    setTimeout(function () {
+      try { if (typeof desktopIconAutoRecheck === 'function') desktopIconAutoRecheck('puzzle-reset'); } catch (_) { }
+    }, 350);
     return Promise.resolve({ ok: true });
   }
 
@@ -496,6 +554,7 @@
     playOut: playOut,
     cancel: cancel,
     reset: reset,
+    _cfg: st, // 调试 / 测试用：可改 inSafetyMs、outSafetyMs
     // 调试用：不进桌面模式，直接在窗口里预览一遍（控制台里调用）
     preview: function () {
       return captureFrame().then(function (img) {

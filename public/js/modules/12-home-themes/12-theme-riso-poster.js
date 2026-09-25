@@ -247,7 +247,9 @@
     '& .rp-gl,& .rp-flat{position:absolute;left:0;top:0;width:100%;height:100%;display:block}',
     '& .rp-stage{position:absolute;left:0;top:0;width:1600px;height:900px;transform-origin:0 0;mix-blend-mode:multiply}',
     '& .rp-s2{pointer-events:none}& .rp-s2>*{pointer-events:auto}& .rp-s2 .np,& .rp-s2 .times{pointer-events:none}& .rp-s2 .times .qt{pointer-events:auto}',
-    '& .rp-speck{position:absolute;inset:0;pointer-events:none;background:var(--paper);transition:background .2s;-webkit-mask-size:100% 100%;mask-size:100% 100%}',
+    // 斑点层没有遮罩时是一整块纸色，会盖住整张海报：遮罩生成好之前先藏起来
+    '& .rp-speck{position:absolute;inset:0;pointer-events:none;background:var(--paper);transition:background .2s;-webkit-mask-size:100% 100%;mask-size:100% 100%;opacity:0;visibility:hidden}',
+    '& .rp-speck.on{opacity:1;visibility:visible}',
     '& .a{color:var(--ia);translate:var(--ax) var(--ay)}& .b{color:var(--ib);translate:var(--bx) var(--by)}& .c{color:var(--ic);translate:var(--cx) var(--cy)}',
     '& .ell{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
     // 巨型标题的点击区（标题本身画在印版上）：点了进入沉浸模式
@@ -566,7 +568,14 @@
     var gl = null, flat = false;
     try { gl = E.cv.getContext('webgl', { antialias: false, premultipliedAlpha: false, preserveDrawingBuffer: false }); } catch (_e) { gl = null; }
     var pc = document.createElement('canvas'), px = pc.getContext('2d');
-    if (!gl) { flat = true; pc.className = 'rp-flat'; E.cv.parentNode.replaceChild(pc, E.cv); }
+    // 退回 2D 平面印刷：没有 WebGL，或着色器编译 / 上下文恢复失败时都走这里
+    function useFlat() {
+      if (flat) return;
+      flat = true; ready = false;
+      pc.className = 'rp-flat';
+      if (E.cv.parentNode) E.cv.parentNode.replaceChild(pc, E.cv);
+    }
+    if (!gl) useFlat();
 
     function measureRoot(w, h) {
       VW = root.clientWidth || w || window.innerWidth;
@@ -587,7 +596,7 @@
       pc.width = cw; pc.height = ch;
       drawPlates();
       if (gl && ready) { gl.viewport(0, 0, cw, ch); sizeFBO(); }
-      scheduleSpeck();
+      if (speckStale()) scheduleSpeck();
     }
 
     // ---------- 印版：R=粉 A，G=蓝 B，B=黄 C ----------
@@ -731,13 +740,20 @@
     }
 
     // ---------- 纸面斑点（纸从墨层里透出来的针孔） ----------
-    var speckUrl = '', speckTimer = 0;
+    var speckUrl = '', speckTimer = 0, speckW = 0, speckH = 0;
+    function speckSize() { return [Math.min(1920, Math.ceil(VW)), Math.min(1080, Math.ceil(VH))]; }
+    // 遮罩按 100% 拉伸，尺寸变化不大（≤12%）时看不出来，不必重新生成
+    function speckStale() {
+      if (!speckUrl) return true;
+      var s = speckSize();
+      return Math.abs(s[0] - speckW) > speckW * 0.12 || Math.abs(s[1] - speckH) > speckH * 0.12;
+    }
     function scheduleSpeck() {
       if (speckTimer) clearTimeout(speckTimer);
       speckTimer = setTimeout(function () { speckTimer = 0; if (!dead) makeSpeck(); }, speckUrl ? 180 : 0);
     }
     function makeSpeck() {
-      var w = Math.min(1920, Math.ceil(VW)), h = Math.min(1080, Math.ceil(VH));
+      var sz = speckSize(), w = sz[0], h = sz[1];
       if (w < 2 || h < 2) return;
       var c = document.createElement('canvas'); c.width = w; c.height = h;
       var x = c.getContext('2d'), id = x.createImageData(w, h), dd = id.data;
@@ -759,8 +775,9 @@
         if (dead || !blob) return;
         var url = URL.createObjectURL(blob);
         E.speck.style.webkitMaskImage = E.speck.style.maskImage = 'url(' + url + ')';
+        E.speck.classList.add('on');
         if (speckUrl) { var old = speckUrl; setTimeout(function () { URL.revokeObjectURL(old); }, 500); }
-        speckUrl = url;
+        speckUrl = url; speckW = w; speckH = h;
       });
     }
 
@@ -1048,11 +1065,14 @@
       if (now) {
         attr(E.hlHit, 'title', '搜索 ' + now.artist);
         txt(E.hlTag, 'SEARCH →');
-        var head = (now.album ? '专辑 《' + now.album + '》' : '单曲') + ' · ' + fmt(now.duration) + (now.providerLabel ? ' · ' + now.providerLabel : '');
+        // 时长未知（≤0）时不显示，免得出现"单曲 · 0:00"
+        var durS = Number(now.duration) > 0 ? fmt(now.duration) : '';
+        var tail = (durS ? ' · ' + durS : '') + (now.providerLabel ? ' · ' + now.providerLabel : '');
+        var head = (now.album ? '专辑 《' + now.album + '》' : '单曲') + tail;
         if (E.headSub._v !== head) {
           E.headSub._v = head;
           E.headSub.innerHTML = now.album
-            ? '专辑 <em>《' + esc(now.album) + '》</em> · ' + esc(fmt(now.duration)) + (now.providerLabel ? ' · ' + esc(now.providerLabel) : '')
+            ? '专辑 <em>《' + esc(now.album) + '》</em>' + esc(tail)
             : esc(head);
         }
       } else {
@@ -1209,12 +1229,23 @@
     function onLost(e) { e.preventDefault(); ready = false; stop(); }
     function onRestored() {
       if (dead) return;
-      try { shaders = []; initGL(); sizeFBO(); upload(); var u = cover.url; cover.url = ''; loadCover(u); start(); once(); } catch (err) { console.warn('[riso-poster] restore', err); }
+      try { shaders = []; initGL(); sizeFBO(); upload(); var u = cover.url; cover.url = ''; loadCover(u); start(); once(); } catch (err) {
+        console.warn('[riso-poster] restore', err);
+        dropGL(); useFlat(); drawPlates();
+      }
+    }
+    // 放弃 WebGL：摘掉监听、释放上下文
+    function dropGL() {
+      if (!gl) return;
+      E.cv.removeEventListener('webglcontextlost', onLost); E.cv.removeEventListener('webglcontextrestored', onRestored);
+      try { var ext = gl.getExtension('WEBGL_lose_context'); if (ext) ext.loseContext(); } catch (_e) { }
+      gl = null; ready = false;
     }
     if (gl) { E.cv.addEventListener('webglcontextlost', onLost); E.cv.addEventListener('webglcontextrestored', onRestored); }
 
     // ---------- 启动 ----------
-    if (gl) { try { initGL(); } catch (err) { console.warn('[riso-poster] GL init', err); ready = false; } }
+    // 着色器编译失败时改用 2D 平面版，不然海报是一片空白
+    if (gl) { try { initGL(); } catch (err) { console.warn('[riso-poster] GL init', err); dropGL(); useFlat(); } }
     applyOff(); applyCSS();
     try { model = ctx.model ? ctx.model() : null; } catch (_e) { model = null; }
     layout();
@@ -1239,6 +1270,8 @@
         last = performance.now();
         measureRoot();
         if (Math.round(VW * DPR) !== (flat ? pc.width : E.cv.width) || Math.round(VH * DPR) !== (flat ? pc.height : E.cv.height)) layout();
+        // 暂停时可能把还没跑的斑点生成取消了，这里补上
+        if (speckStale()) scheduleSpeck();
         start(); once();
       },
       destroy: function () {

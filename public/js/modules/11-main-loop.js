@@ -307,7 +307,15 @@ function animate() {
   }
   if (shouldSkipAdaptiveRenderFrame(now)) return;
   // 主页全屏主题盖住 3D 场景时，场景休眠，省下显卡给主题
-  if (typeof homeThemeCoversScene === 'function' && homeThemeCoversScene()) { prevTime = now; return; }
+  if (typeof homeThemeCoversScene === 'function' && homeThemeCoversScene()) {
+    // [修] 只停 3D；桌面歌词照常按原来的节奏同步，音频上下文被挂起时照常唤醒
+    var coveredDt = Math.min((now - prevTime) / 1000, 0.05);
+    prevTime = now;
+    if (analyser && playing && audio && !audio.paused && audioCtx && audioCtx.state === 'suspended' && typeof resumeAudioAnalysis === 'function') resumeAudioAnalysis();
+    var coveredOverlayDt = consumeFrameGate(mainFrameGates.desktopOverlay, now, coveredDt, targetMainDesktopOverlayFps(now), false, 'desktop-overlay');
+    if (coveredOverlayDt > 0) syncDesktopOverlayState();
+    return;
+  }
   var dt = Math.min((now - prevTime) / 1000, 0.05);
   prevTime = now;
   sampleRenderPerf(now, dt);

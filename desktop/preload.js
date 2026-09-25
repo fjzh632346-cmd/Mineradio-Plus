@@ -130,6 +130,7 @@ contextBridge.exposeInMainWorld('desktopWindow', {
   requestGestureCameraPermission: () => ipcRenderer.invoke('mineradio-gesture-camera-request-permission'),
   updateDesktopIconShields: (payload) => ipcRenderer.send('mineradio-full-desktop-icon-shields', payload || {}),
   setDesktopSoftwareLocked: (locked) => ipcRenderer.invoke('mineradio-full-desktop-set-software-lock', locked === true),
+  setDesktopEscapeSuspended: (suspended) => ipcRenderer.invoke('mineradio-full-desktop-suspend-escape', suspended === true),
   setDesktopIconsVisible: (visible) => ipcRenderer.invoke('mineradio-full-desktop-set-icons-visible', visible !== false),
   requestDesktopKeyboardFocus: (reason) => ipcRenderer.invoke(
     'mineradio-full-desktop-request-keyboard-focus',

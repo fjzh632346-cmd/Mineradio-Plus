@@ -10,6 +10,8 @@ var homeThemeData = {
   qqPoolDay: '',
   qqPoolLoading: false,
   qqPlaylists: [],
+  qqUser: null,        // 当前 QQ 池属于哪个 QQ 账号（null = 没有 / 未登录）
+  qqLoadSeq: 0,        // 换号 / 退出时 +1，让还在路上的旧账号加载作废
   listeners: [],
   notifyTimer: 0,
 };
@@ -85,18 +87,52 @@ function homeThemeLoggedIn(provider) {
 }
 
 // ---------- QQ 替代数据：从"我的 QQ 歌单"里每天抽一批 ----------
+function homeThemeQQAccountKey() {
+  try {
+    var st = typeof qqLoginStatus !== 'undefined' ? qqLoginStatus : null;
+    return String(st && (st.userId || st.uin || st.uid) || '');
+  } catch (_e) { return ''; }
+}
+function homeThemeClearQQPool() {
+  homeThemeData.qqPool = [];
+  homeThemeData.qqPlaylists = [];
+  homeThemeData.qqPoolDay = '';
+  homeThemeData.qqLoadSeq += 1;
+  homeThemeData.qqPoolLoading = false;
+}
+// QQ 退出 → 清空；换了账号 → 清空并重新加载。返回 true 表示刚清过。
+function homeThemeCheckQQAccount() {
+  if (!homeThemeLoggedIn('qq')) {
+    var dirty = homeThemeData.qqUser !== null || homeThemeData.qqPool.length || homeThemeData.qqPlaylists.length || homeThemeData.qqPoolDay;
+    homeThemeData.qqUser = null;
+    if (dirty) { homeThemeClearQQPool(); homeThemeNotify(); return true; }
+    return false;
+  }
+  var key = homeThemeQQAccountKey();
+  if (homeThemeData.qqUser === key) return false;
+  var hadData = homeThemeData.qqUser !== null || homeThemeData.qqPool.length || homeThemeData.qqPlaylists.length;
+  homeThemeData.qqUser = key;
+  homeThemeClearQQPool();
+  setTimeout(function () { homeThemeLoadQQPool(true); }, 0);
+  if (hadData) homeThemeNotify();
+  return true;
+}
+
 async function homeThemeLoadQQPool(force) {
-  if (!homeThemeLoggedIn('qq')) { homeThemeData.qqPool = []; return; }
+  homeThemeCheckQQAccount();
+  if (!homeThemeLoggedIn('qq')) return;
   var day = homeThemeDayKey();
   if (!force && homeThemeData.qqPoolDay === day && homeThemeData.qqPool.length) return;
   if (homeThemeData.qqPoolLoading) return;
   homeThemeData.qqPoolLoading = true;
+  var seq = homeThemeData.qqLoadSeq;
   try {
     var lists = await apiJson('/api/qq/user/playlists');
+    if (seq !== homeThemeData.qqLoadSeq) return; // 期间退出 / 换号了，结果作废
     var rows = (lists && (lists.playlists || lists.data || lists.list)) || [];
     if (!Array.isArray(rows)) rows = [];
     rows = rows.filter(function (row) { return row && row.id; });
-    homeThemeData.qqPlaylists = rows;
+    var playlistsRows = rows;
     // 优先"我喜欢"，再按日期轮换 1~2 张其他歌单
     var liked = rows.filter(function (row) { return row.virtual || /我喜欢|liked|fav/i.test(String(row.name || '')); });
     var others = homeThemeSeededShuffle(rows.filter(function (row) { return liked.indexOf(row) < 0; }), day);
@@ -109,6 +145,8 @@ async function homeThemeLoadQQPool(force) {
         pool = pool.concat(tracks);
       } catch (e) { console.warn('[HomeTheme] QQ playlist tracks', e); }
     }
+    if (seq !== homeThemeData.qqLoadSeq) return;
+    homeThemeData.qqPlaylists = playlistsRows;
     var seen = Object.create(null);
     pool = pool.filter(function (song) {
       var k = homeThemeTrack(song).key;
@@ -121,7 +159,7 @@ async function homeThemeLoadQQPool(force) {
   } catch (e) {
     console.warn('[HomeTheme] QQ pool', e);
   } finally {
-    homeThemeData.qqPoolLoading = false;
+    if (seq === homeThemeData.qqLoadSeq) homeThemeData.qqPoolLoading = false;
     homeThemeNotify();
   }
 }
@@ -220,6 +258,7 @@ function homeThemeRadioItems(neteaseIn, qqIn) {
 }
 
 function buildHomeThemeModel() {
+  try { homeThemeCheckQQAccount(); } catch (_e) { }
   var now = new Date();
   var current = homeThemeCurrentSong();
   var duration = 0, position = 0;
@@ -239,6 +278,23 @@ function buildHomeThemeModel() {
   } catch (_e) { }
   var nextInfo = null;
   try { nextInfo = typeof homeDashboardNextQueueInfo === 'function' ? homeDashboardNextQueueInfo() : null; } catch (_e) { }
+  // 队列里当前这首后面还有几首
+  var queueTotal = 0;
+  try {
+    if (typeof playQueue !== 'undefined' && Array.isArray(playQueue) && playQueue.length) {
+      var ci = typeof currentIdx === 'number' ? currentIdx : -1;
+      queueTotal = ci >= 0 && ci < playQueue.length ? playQueue.length - 1 - ci : playQueue.length;
+    }
+  } catch (_e) { }
+  // 只有真在队列里、而且不是正在放的这首，才算"下一首"（队列空时 A.next() 什么都不做，别给主题一个点不动的下一首）
+  var nextTrackModel = null;
+  try {
+    if (nextInfo && nextInfo.song && nextInfo.queued && Array.isArray(playQueue) && playQueue.length > 1) {
+      nextTrackModel = homeThemeTrack(nextInfo.song);
+      var curTrack = current ? homeThemeTrack(current) : null;
+      if (nextInfo.song === current || (curTrack && nextTrackModel && curTrack.key === nextTrackModel.key)) nextTrackModel = null;
+    }
+  } catch (_e) { nextTrackModel = null; }
 
   var metrics = { listenMs: 0, songCount: 0, topArtist: '' };
   try { metrics = homeDashboardTodayListenMetrics(); } catch (_e) { }
@@ -272,8 +328,9 @@ function buildHomeThemeModel() {
       playing: isPlaying,
       liked: homeThemeIsLiked(current),
     }) : null,
-    next: nextInfo && nextInfo.song ? homeThemeTrack(nextInfo.song) : null,
+    next: nextTrackModel,
     queue: queue,
+    queueTotal: queueTotal,
     lyricsOn: !!(typeof fx === 'object' && fx && fx.particleLyrics),
     today: {
       minutes: Math.floor((metrics.listenMs || 0) / 60000),
@@ -379,6 +436,7 @@ var homeThemeActions = {
     return homeThemePlayList(songs, idx, contextName);
   },
   playDaily: function (index) {
+    homeThemeCheckQQAccount();
     var src = homeThemeDailySource();
     if (src.kind === 'netease-daily') {
       // 从点中的那一首开始播，整份每日推荐作为队列
@@ -458,6 +516,7 @@ var homeThemeActions = {
   },
   openDiscover: function () {
     if (homeThemeLoggedIn('netease')) return openHomeDashboardCharts();
+    homeThemeCheckQQAccount();
     var rows = homeThemeData.qqPlaylists;
     if (rows.length) {
       var row = homeThemeSeededShuffle(rows, 'discover-' + Date.now())[0];
@@ -469,6 +528,7 @@ var homeThemeActions = {
   },
   openRadio: function () {
     if (homeThemeLoggedIn('netease')) return openHomeDashboardRadio();
+    homeThemeCheckQQAccount();
     if (homeThemeData.qqPool.length) return homeThemePlayList(homeThemeSeededShuffle(homeThemeData.qqPool, 'radio-' + Date.now()), 0, 'QQ 歌单电台');
     return homeThemeActions.openLogin();
   },
@@ -486,6 +546,7 @@ var homeThemeActions = {
     renderHomeDashboard = function () {
       var result = originalRender.apply(this, arguments);
       homeThemeNotify();
+      homeThemeCheckQQAccount();
       if (homeThemeLoggedIn('qq') && !homeThemeData.qqPool.length && !homeThemeData.qqPoolLoading) homeThemeLoadQQPool(false);
       return result;
     };

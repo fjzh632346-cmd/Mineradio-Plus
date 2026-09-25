@@ -119,6 +119,7 @@
     'js/modules/13-desktop-extras/03-desktop-bg-button.js',
     'js/modules/13-desktop-extras/04-desktop-top-player.js',
     'js/modules/13-desktop-extras/05-desktop-fps-cap.js',
+    'js/modules/13-desktop-extras/06-desktop-esc-guard.js',
   ];
 
   function readModule(path) {
