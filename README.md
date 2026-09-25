@@ -1,3 +1,15 @@
+# Mineradio Plus
+
+> **这是 Mineradio 的二次修改版（非官方）。** 原项目：[XxHuberrr/Mineradio](https://github.com/XxHuberrr/Mineradio)（GPL-3.0，已长期停更）。
+> 本仓库在原版 v2.2.0 基础上修改，主要改动：
+> - 主页主题：星图（北斗天穹）、调频、孔版海报，左上角拉绳切换，设置里也能改
+> - 完整桌面模式增强：进出桌面的拼图过场、编辑态自动隐藏桌面图标、右键回退、顶部滑出播放器与搜索、限帧省电、输入时 Esc 不误退桌面模式
+> - 修改代码集中在 `public/js/modules/12-home-themes/`、`public/js/modules/13-desktop-extras/`，以及 `desktop/main.js` 等文件里标注 `[二改]` / `[修]` 的地方
+>
+> 以下为原项目说明。
+
+---
+
 # Mineradio
 
 > **项目状态：长期停更**

@@ -67,3 +67,7 @@ tmp/
 *.png.tmp
 verification/
 screenshots/
+
+# Mineradio Plus 本地文件
+_debug_desktop/
+_backup_*/
