@@ -55,7 +55,7 @@ module.exports = async function afterPack(context) {
 
   const version = context.packager.appInfo.version;
   console.log(`  • injecting Mineradio resources  rcedit=${rceditPath}`);
-  execFileSync(rceditPath, [
+  const rceditArgs = [
     exePath,
     '--set-icon', iconPath,
     '--set-version-string', 'FileDescription', productName,
@@ -64,5 +64,8 @@ module.exports = async function afterPack(context) {
     '--set-version-string', 'OriginalFilename', `${appName}.exe`,
     '--set-file-version', version,
     '--set-product-version', version
-  ], { stdio: 'inherit' });
+  ];
+  // Cross-building on Linux/macOS: run the Windows rcedit through wine.
+  if (process.platform === 'win32') execFileSync(rceditPath, rceditArgs, { stdio: 'inherit' });
+  else execFileSync('wine', [path.join(path.dirname(rceditPath), 'rcedit.exe')].concat(rceditArgs), { stdio: 'inherit' });
 };
